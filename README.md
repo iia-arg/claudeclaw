@@ -247,9 +247,6 @@ src/
   service.ts                       # Service entry (launchd/systemd, runs message loop)
   orchestrator/
     message-loop.ts                # THE HEART: poll, trigger, thread, queue, dispatch
-    sandbox-runner.ts              # Sandbox runtime (srt CLI, settings, credentials)
-    container-runner.ts            # Container runtime (Apple Container / Docker)
-    container-runtime.ts           # Container binary abstraction
     extensions.ts                  # Pluggable extension system
     channel-registry.ts            # Channel self-registration
     config.ts                      # Configuration (from .env, including RUNTIME)
@@ -258,6 +255,10 @@ src/
     group-queue.ts                 # Concurrency control
     ipc.ts                         # File-based IPC watcher
     types.ts                       # Core types (AgentConfig, RegisteredGroup, etc.)
+  runtimes/
+    sandbox-runner.ts              # Sandbox runtime (srt CLI, settings, credentials)
+    container-runner.ts            # Container runtime (Apple Container / Docker)
+    container-runtime.ts           # Container binary abstraction
   channels/                        # Built-in channels (whatsapp, telegram)
   webhook/
     server.ts                      # HTTP server with HMAC-SHA256 auth
