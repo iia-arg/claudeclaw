@@ -16,17 +16,6 @@
 
 Built on [NanoClaw](https://github.com/qwibitai/nanoclaw) — ported to a Claude Code plugin architecture with a pluggable extension system and Anthropic's sandbox runtime.
 
-## Extensions
-
-Channels and agents are installable extensions — install only what you need:
-
-| Extension | Type | Install |
-|-----------|------|---------|
-| [claudeclaw-slack](https://github.com/sbusso/claudeclaw-slack) | Channel | `/install-extension slack` |
-| [claudeclaw-triage](https://github.com/sbusso/claudeclaw-triage) | Agent | `/install-extension triage` |
-
-More planned: [Discord](https://github.com/sbusso/claudeclaw#future-extensions), [Gmail](https://github.com/sbusso/claudeclaw#future-extensions), [QMD Memory](https://github.com/sbusso/claudeclaw#qmd-semantic-memory), [Obsidian](https://github.com/sbusso/claudeclaw#future-extensions), [TUI](https://github.com/sbusso/claudeclaw#future-extensions).
-
 ## What It Does
 
 ClaudeClaw is a Claude Code plugin that provides an always-on message loop. It listens to channels (Slack, WhatsApp, Telegram), routes messages to Claude agents running in isolated sandboxes, and manages ongoing conversations with structured memory.
@@ -336,7 +325,14 @@ registerExtension({
 });
 ```
 
-Built-in extensions: **webhook triggers**, **cost tracking**. Installable: [**claudeclaw-slack**](https://github.com/sbusso/claudeclaw-slack), [**claudeclaw-triage**](https://github.com/sbusso/claudeclaw-triage).
+Built-in extensions: **webhook triggers**, **cost tracking**. Installable:
+
+| Extension | Type | Install |
+|-----------|------|---------|
+| [claudeclaw-slack](https://github.com/sbusso/claudeclaw-slack) | Channel | `/install-extension slack` |
+| [claudeclaw-triage](https://github.com/sbusso/claudeclaw-triage) | Agent | `/install-extension triage` |
+
+More planned: [Discord](#future-extensions), [Gmail](#future-extensions), [QMD Memory](#qmd-semantic-memory), [Obsidian](#future-extensions), [TUI](#future-extensions).
 
 ## Customizing
 
