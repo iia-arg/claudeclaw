@@ -6,10 +6,15 @@
 
 <p align="center">Persistent agent orchestrator plugin for Claude Code. Multi-channel message routing, structured memory, webhook triggers, cost tracking — with OS-level sandbox isolation.</p>
 
-Built on [NanoClaw](https://github.com/qwibitai/nanoclaw) — ported to a Claude Code plugin architecture with a pluggable extension system and Anthropic's sandbox runtime.
+<p align="center">
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://github.com/sbusso/claudeclaw/stargazers"><img src="https://img.shields.io/github/stars/sbusso/claudeclaw?style=flat" alt="GitHub Stars"></a>
+  <a href="https://github.com/sbusso/claudeclaw/issues"><img src="https://img.shields.io/github/issues/sbusso/claudeclaw" alt="Issues"></a>
+  <a href="https://github.com/sbusso/claudeclaw/discussions"><img src="https://img.shields.io/github/discussions/sbusso/claudeclaw" alt="Discussions"></a>
+  <a href="https://github.com/sbusso/claudeclaw"><img src="https://img.shields.io/badge/Claude_Code-Plugin-blueviolet" alt="Claude Code Plugin"></a>
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub Stars](https://img.shields.io/github/stars/sbusso/claudeclaw)](https://github.com/sbusso/claudeclaw)
+Built on [NanoClaw](https://github.com/qwibitai/nanoclaw) — ported to a Claude Code plugin architecture with a pluggable extension system and Anthropic's sandbox runtime.
 
 ## Extensions
 
