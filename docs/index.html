@@ -163,7 +163,7 @@
       border-collapse: collapse;
       margin-top: 2rem;
       font-size: 0.95rem;
-      min-width: 500px;
+      min-width: 600px;
     }
 
     .comparison-table th {
@@ -428,14 +428,15 @@
   <!-- Comparison -->
   <section id="comparison" class="section" style="background: linear-gradient(to bottom, #0A0E14, #0F0F14);">
     <div class="container fade-in">
-      <h2>Why not OpenClaw?</h2>
-      <p class="subtitle">OpenClaw is a platform. ClaudeClaw is a tool. Same problem, different philosophy.</p>
+      <h2>How does it compare?</h2>
+      <p class="subtitle">Three approaches to the same problem — different trade-offs.</p>
       <div class="comparison-table-wrap">
       <table class="comparison-table">
         <thead>
           <tr>
             <th></th>
-            <th>ClaudeClaw</th>
+            <th class="accent">ClaudeClaw</th>
+            <th>NanoClaw</th>
             <th>OpenClaw</th>
           </tr>
         </thead>
@@ -443,36 +444,55 @@
           <tr>
             <td>Codebase</td>
             <td class="accent">~8K lines</td>
-            <td>500K+ lines</td>
+            <td>~500 lines</td>
+            <td>~400K lines</td>
           </tr>
           <tr>
             <td>Security model</td>
             <td class="accent">Kernel-enforced sandbox</td>
-            <td>Application-level checks</td>
+            <td>Docker isolation</td>
+            <td>Opt-in sandboxing</td>
           </tr>
           <tr>
             <td>Cold start</td>
             <td class="accent">&lt;10ms</td>
-            <td>Seconds</td>
+            <td>~2-5s</td>
+            <td>~2-5s native</td>
           </tr>
           <tr>
-            <td>Requires Docker</td>
+            <td>Docker required</td>
             <td class="accent">No</td>
             <td>Yes</td>
+            <td>Optional</td>
           </tr>
           <tr>
             <td>Auditability</td>
             <td class="accent">Fits in context window</td>
-            <td>Requires team</td>
+            <td>Read in 8 minutes</td>
+            <td>Open source, complex</td>
           </tr>
           <tr>
             <td>Configuration</td>
             <td class="accent">Code changes (git revert)</td>
-            <td>Config file sprawl</td>
+            <td>Minimal config</td>
+            <td>JSON config + CLI</td>
+          </tr>
+          <tr>
+            <td>Extensions</td>
+            <td class="accent">Pluggable system</td>
+            <td>None</td>
+            <td>Skills ecosystem</td>
+          </tr>
+          <tr>
+            <td>Memory</td>
+            <td class="accent">Structured + searchable</td>
+            <td>Basic</td>
+            <td>MEMORY.md + SOUL.md</td>
           </tr>
         </tbody>
       </table>
       </div>
+      <p style="margin-top: 1rem; font-size: 0.85rem; color: var(--text-muted);">ClaudeClaw is built on <a href="https://github.com/qwibitai/nanoclaw">NanoClaw</a>, adding sandbox isolation, extensions, structured memory, and multi-channel routing.</p>
     </div>
   </section>
 
