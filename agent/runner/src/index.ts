@@ -548,6 +548,20 @@ async function runQuery(
           CLAUDECLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
         },
       },
+      ...(process.env.LIGHTRAG_BASE_URL || fs.existsSync('/srv/lightrag/mcp/server.mjs')
+        ? {
+            lightrag: {
+              command: 'node',
+              args: ['/srv/lightrag/mcp/server.mjs'],
+              env: {
+                LIGHTRAG_API_KEY:
+                  process.env.LIGHTRAG_API_KEY || 'local-lightrag-key',
+                LIGHTRAG_BASE_URL:
+                  process.env.LIGHTRAG_BASE_URL || 'http://127.0.0.1:9621',
+              },
+            },
+          }
+        : {}),
     },
     hooks: {
       PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
