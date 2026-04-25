@@ -41,6 +41,7 @@ export interface AgentConfig {
   maxTurns?: number;           // Max conversation turns
   costLimitUsd?: number;       // Per-run budget cap
   allowedDomains?: string[];   // Extra network domains the sandbox agent can access (merged with base Anthropic + localhost)
+  unsandboxed?: boolean;       // Skip srt sandbox entirely — agent runs as the host user with no network/fs isolation. Use only on trusted internal hosts.
 }
 
 export interface RegisteredGroup {

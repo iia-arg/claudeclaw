@@ -383,7 +383,16 @@ export async function runSandboxAgent(
   const settings = buildSandboxSettings(mounts, extraDomains);
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
 
-  const sandboxArgs = buildSandboxArgs(settingsPath);
+  const unsandboxed = group.agentConfig?.unsandboxed === true;
+  const sandboxArgs = unsandboxed
+    ? ['node', path.join(CODE_ROOT, 'agent', 'runner', 'dist', 'index.js')]
+    : buildSandboxArgs(settingsPath);
+  if (unsandboxed) {
+    logger.warn(
+      { group: group.name },
+      'Agent running UNSANDBOXED — no network or filesystem isolation',
+    );
+  }
 
   logger.info(
     {
