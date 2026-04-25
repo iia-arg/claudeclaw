@@ -591,9 +591,16 @@ describe('TelegramChannel', () => {
       const ctx = createMediaCtx({});
       await triggerMediaMessage('message:voice', ctx);
 
+      // After local-Whisper integration, voice triggers a transcription attempt.
+      // In tests there's no real Telegram API to download from, so it falls back
+      // to the unavailable-placeholder.
       expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',
-        expect.objectContaining({ content: '[Voice message]' }),
+        expect.objectContaining({
+          content: expect.stringMatching(
+            /^\[Voice (transcript|message — transcription unavailable)\]/,
+          ),
+        }),
       );
     });
 

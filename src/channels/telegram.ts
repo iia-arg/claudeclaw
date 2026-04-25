@@ -1,7 +1,63 @@
+import { execFile } from 'child_process';
+import fs from 'fs';
 import https from 'https';
+import os from 'os';
+import path from 'path';
+import { promisify } from 'util';
 import { Api, Bot } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../orchestrator/config.js';
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Local Whisper transcription via /usr/local/bin/transcribe-local-shared.
+ * Returns transcribed text or null on failure (network down, ffmpeg missing, etc.).
+ */
+async function transcribeTelegramAudio(
+  fileId: string,
+  api: Api,
+  botToken: string,
+  language = 'ru',
+): Promise<string | null> {
+  const TRANSCRIBER = '/usr/local/bin/transcribe-local-shared';
+  if (!fs.existsSync(TRANSCRIBER)) return null;
+  let tmpdir: string | null = null;
+  try {
+    const fileInfo = await api.getFile(fileId);
+    if (!fileInfo.file_path) return null;
+    const url = `https://api.telegram.org/file/bot${botToken}/${fileInfo.file_path}`;
+
+    tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-voice-'));
+    const ext = path.extname(fileInfo.file_path) || '.ogg';
+    const inputPath = path.join(tmpdir, `audio${ext}`);
+    const wavPath = path.join(tmpdir, 'audio.wav');
+
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`download failed: ${resp.status}`);
+    fs.writeFileSync(inputPath, Buffer.from(await resp.arrayBuffer()));
+
+    await execFileAsync(
+      'ffmpeg',
+      ['-y', '-i', inputPath, '-ar', '16000', '-ac', '1', wavPath],
+      { timeout: 60_000 },
+    );
+
+    const { stdout } = await execFileAsync(
+      TRANSCRIBER,
+      [wavPath, language],
+      { timeout: 180_000, maxBuffer: 10 * 1024 * 1024 },
+    );
+    return stdout.trim() || null;
+  } catch (err) {
+    logger.warn({ err: (err as Error).message, fileId }, 'Voice transcription failed');
+    return null;
+  } finally {
+    if (tmpdir) {
+      try { fs.rmSync(tmpdir, { recursive: true, force: true }); } catch {}
+    }
+  }
+}
 import { readEnvFile } from '../orchestrator/env.js';
 import { logger } from '../orchestrator/logger.js';
 import { registerChannel, ChannelOpts } from '../orchestrator/channel-registry.js';
@@ -195,8 +251,26 @@ export class TelegramChannel implements Channel {
 
     this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
-    this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
+    this.bot.on('message:voice', async (ctx) => {
+      const fileId = ctx.message.voice?.file_id;
+      const transcript = fileId
+        ? await transcribeTelegramAudio(fileId, this.bot!.api, this.botToken)
+        : null;
+      const placeholder = transcript
+        ? `[Voice transcript]: ${transcript}`
+        : '[Voice message — transcription unavailable]';
+      storeNonText(ctx, placeholder);
+    });
+    this.bot.on('message:audio', async (ctx) => {
+      const fileId = ctx.message.audio?.file_id;
+      const transcript = fileId
+        ? await transcribeTelegramAudio(fileId, this.bot!.api, this.botToken)
+        : null;
+      const placeholder = transcript
+        ? `[Audio transcript]: ${transcript}`
+        : '[Audio]';
+      storeNonText(ctx, placeholder);
+    });
     this.bot.on('message:document', (ctx) => {
       const name = ctx.message.document?.file_name || 'file';
       storeNonText(ctx, `[Document: ${name}]`);
