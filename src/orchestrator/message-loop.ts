@@ -754,7 +754,7 @@ export async function main(): Promise<void> {
     const factory = getChannelFactory(channelName)!;
     const channel = factory(channelOpts);
     if (!channel) {
-      logger.warn(
+      logger.info(
         { channel: channelName },
         'Channel installed but credentials missing — skipping. Check .env or re-run the channel skill.',
       );

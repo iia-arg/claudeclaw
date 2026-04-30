@@ -402,7 +402,7 @@ registerChannel('whatsapp', (opts: ChannelOpts) => {
   const authDir = path.join(STORE_DIR, 'auth');
   const credsFile = path.join(authDir, 'creds.json');
   if (!fs.existsSync(credsFile)) {
-    logger.warn('WhatsApp: no auth credentials found (store/auth/creds.json) — skipping. Run /add-whatsapp to set up.');
+    logger.info('WhatsApp: no auth credentials found (store/auth/creds.json) — skipping. Run /add-whatsapp to set up.');
     return null;
   }
   return new WhatsAppChannel(opts);
