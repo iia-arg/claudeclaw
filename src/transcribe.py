@@ -3,7 +3,16 @@
 import sys
 import os
 
-MODEL_BASE = "/opt/whisper-local/models/models--Systran--faster-whisper-medium/snapshots"
+# Override via env for non-standard installs. Defaults match a local
+# faster-whisper-medium install under /opt/whisper-local/.
+MODEL_BASE = os.environ.get(
+    "WHISPER_MODEL_BASE",
+    "/opt/whisper-local/models/models--Systran--faster-whisper-medium/snapshots",
+)
+WHISPER_VENV_SITE = os.environ.get(
+    "WHISPER_VENV_SITE",
+    "/opt/whisper-local/venv/lib/python3.12/site-packages",
+)
 
 def get_model_path():
     if os.path.isdir(MODEL_BASE):
@@ -22,7 +31,8 @@ def main():
         print(f"File not found: {audio_path}", file=sys.stderr)
         sys.exit(1)
 
-    sys.path.insert(0, "/opt/whisper-local/venv/lib/python3.12/site-packages")
+    if os.path.isdir(WHISPER_VENV_SITE):
+        sys.path.insert(0, WHISPER_VENV_SITE)
     from faster_whisper import WhisperModel
 
     model_path = get_model_path()

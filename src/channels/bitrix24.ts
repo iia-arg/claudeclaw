@@ -15,7 +15,9 @@ import * as path from 'path';
 import * as os from 'os';
 
 const execFileAsync = promisify(execFile);
-const TRANSCRIBER = '/usr/local/bin/transcribe-local-shared';
+// Local Whisper transcription helper. Override via WHISPER_TRANSCRIBER env.
+const TRANSCRIBER =
+  process.env.WHISPER_TRANSCRIBER || '/usr/local/bin/transcribe-local-shared';
 
 const MAX_VOICE_BYTES = 10_000_000; // ~10 МБ — хватает на 5-10 мин речи в OGG/Opus или MP3 (защита от часовых записей)
 const MAX_FILE_BYTES = 50_000_000; // ~50 МБ — лимит для не-аудио вложений

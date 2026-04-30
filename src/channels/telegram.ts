@@ -11,8 +11,10 @@ import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../orchestrator/config.js';
 const execFileAsync = promisify(execFile);
 
 /**
- * Local Whisper transcription via /usr/local/bin/transcribe-local-shared.
- * Returns transcribed text or null on failure (network down, ffmpeg missing, etc.).
+ * Local Whisper transcription. Path is configurable via WHISPER_TRANSCRIBER
+ * env var; defaults to /usr/local/bin/transcribe-local-shared. Returns
+ * transcribed text or null on failure (transcriber missing, network down,
+ * ffmpeg missing, etc.).
  */
 async function transcribeTelegramAudio(
   fileId: string,
@@ -20,7 +22,8 @@ async function transcribeTelegramAudio(
   botToken: string,
   language = 'ru',
 ): Promise<string | null> {
-  const TRANSCRIBER = '/usr/local/bin/transcribe-local-shared';
+  const TRANSCRIBER =
+    process.env.WHISPER_TRANSCRIBER || '/usr/local/bin/transcribe-local-shared';
   if (!fs.existsSync(TRANSCRIBER)) return null;
   let tmpdir: string | null = null;
   try {
