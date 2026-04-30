@@ -2,12 +2,19 @@ import { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 
-import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
+import {
+  ASSISTANT_NAME,
+  DEFAULT_RUNTIME,
+  SCHEDULER_POLL_INTERVAL,
+  TIMEZONE,
+} from './config.js';
 import {
   ContainerOutput,
   runContainerAgent,
   writeTasksSnapshot,
 } from '../runtimes/container-runner.js';
+import { runSandboxAgent } from '../runtimes/sandbox-runner.js';
+import { runDeepSeekAgent } from '../runtimes/deepseek-runner.js';
 import {
   getAllTasks,
   getDueTasks,
@@ -16,6 +23,7 @@ import {
   updateTask,
   updateTaskAfterRun,
 } from './db.js';
+import { writeExtensionToolsManifest } from './extension-tool-bridge.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -146,6 +154,9 @@ async function runTask(
     })),
   );
 
+  // Refresh extension-tools manifest so agent-runner sees current tool list
+  writeExtensionToolsManifest(task.group_folder);
+
   let result: string | null = null;
   let error: string | null = null;
 
@@ -169,7 +180,18 @@ async function runTask(
   };
 
   try {
-    const output = await runContainerAgent(
+    // Match message-loop's runtime selection: per-group override, then DEFAULT_RUNTIME.
+    // Without this, scheduled tasks always tried Docker even when the instance
+    // is configured for sandbox/deepseek via .env RUNTIME.
+    const runtime = group.runtime || DEFAULT_RUNTIME;
+    const runner =
+      runtime === 'deepseek'
+        ? runDeepSeekAgent
+        : runtime === 'sandbox'
+          ? runSandboxAgent
+          : runContainerAgent;
+
+    const output = await runner(
       group,
       {
         prompt: task.prompt,
@@ -179,6 +201,7 @@ async function runTask(
         isMain,
         isScheduledTask: true,
         assistantName: ASSISTANT_NAME,
+        agentConfig: group.agentConfig,
       },
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),

@@ -12,3 +12,11 @@ extensions/
 
 # Brainstorm sessions
 .superpowers/
+
+# Server-specific maintenance scripts (not part of the ClaudeClaw distribution)
+scripts/backup.sh
+scripts/restore.sh
+scripts/gdrive-upload.py
+scripts/create-gdoc.cjs
+scripts/get-doc-link.cjs
+scripts/google-oauth.py

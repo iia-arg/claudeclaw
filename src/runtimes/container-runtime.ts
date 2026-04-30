@@ -9,11 +9,11 @@ import os from 'os';
 import { logger } from '../orchestrator/logger.js';
 
 /** The container runtime binary name. */
-export const CONTAINER_RUNTIME_BIN = 'container';
+export const CONTAINER_RUNTIME_BIN = 'docker' as 'docker' | 'container';
 
 /** Hostname containers use to reach the host machine. */
 export const CONTAINER_HOST_GATEWAY =
-  CONTAINER_RUNTIME_BIN === 'container'
+  (CONTAINER_RUNTIME_BIN as string) === 'container'
     ? '192.168.64.1'
     : 'host.docker.internal';
 
@@ -28,7 +28,7 @@ export const PROXY_BIND_HOST =
 
 function detectProxyBindHost(): string {
   // Apple Container uses a bridged network — bind to all interfaces so the VM can reach the proxy
-  if (os.platform() === 'darwin' && CONTAINER_RUNTIME_BIN === 'container')
+  if (os.platform() === 'darwin' && (CONTAINER_RUNTIME_BIN as string) === 'container')
     return '0.0.0.0';
   if (os.platform() === 'darwin') return '127.0.0.1';
 

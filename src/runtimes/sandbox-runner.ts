@@ -307,6 +307,16 @@ export function buildSandboxSettings(
     }
   }
 
+  // Always allow the extension-tool-bridge IPC dirs:
+  //   request dir: agent writes JSON, orchestrator reads
+  //   response dir: orchestrator writes JSON, agent reads
+  // Without these, MCP tool calls registered via extensions silently fail
+  // in restricted sandboxes (EPERM/EACCES on the request file write).
+  const extToolReqDir = path.join(DATA_DIR, 'ipc', '_tool-requests');
+  const extToolRespDir = path.join(DATA_DIR, 'ipc', '_tool-responses');
+  allowWrite.push(extToolReqDir);
+  allowRead.push(extToolRespDir);
+
   // Merge base + extra domains, deduplicate
   const baseDomains = [
     'api.anthropic.com',
@@ -422,6 +432,18 @@ export async function runSandboxAgent(
       else if (mount.containerPath?.startsWith('/workspace/extra'))
         pathEnv.CLAUDECLAW_EXTRA_DIR = mount.hostPath;
     }
+    // Shared dirs for the extension-tool bridge (request/response IPC).
+    // Sandbox runs on host, so we point directly to the orchestrator's DATA_DIR.
+    pathEnv.CLAUDECLAW_EXT_TOOL_REQ_DIR = path.join(
+      DATA_DIR,
+      'ipc',
+      '_tool-requests',
+    );
+    pathEnv.CLAUDECLAW_EXT_TOOL_RESP_DIR = path.join(
+      DATA_DIR,
+      'ipc',
+      '_tool-responses',
+    );
 
     // Sandbox: real credentials + restricted network (no proxy needed)
     const secrets = readEnvFile([

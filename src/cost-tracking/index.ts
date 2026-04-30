@@ -21,6 +21,21 @@ registerExtension({
       status TEXT NOT NULL,
       run_at TEXT NOT NULL
     )`,
+    // Auxiliary service runs — small per-call costs from non-agent services
+    // (TTS, vision-OCR, embeddings, etc.) that are still worth tracking.
+    `CREATE TABLE IF NOT EXISTS aux_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      service TEXT NOT NULL,           -- 'fish-audio-tts' | 'openai-vision' | ...
+      model TEXT,                      -- e.g. 's1', 'gpt-4o-mini'
+      group_folder TEXT,               -- nullable, for cross-group services
+      chat_jid TEXT,
+      input_units INTEGER DEFAULT 0,   -- bytes for TTS, prompt_tokens for OpenAI
+      output_units INTEGER DEFAULT 0,  -- 0 for TTS, completion_tokens for OpenAI
+      cost_usd REAL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'success',
+      meta TEXT,                       -- optional JSON for extras (file path, etc.)
+      run_at TEXT NOT NULL
+    )`,
   ],
 });
 
@@ -59,6 +74,71 @@ export interface AgentRunRecord {
   model?: string;
   status: 'success' | 'error';
 }
+
+// ---------------------------------------------------------------------------
+// Auxiliary service runs (TTS, vision OCR, etc.)
+// ---------------------------------------------------------------------------
+
+export interface AuxRunRecord {
+  service: string;
+  model?: string;
+  groupFolder?: string;
+  chatJid?: string;
+  inputUnits?: number;
+  outputUnits?: number;
+  costUsd: number;
+  status?: 'success' | 'error';
+  meta?: Record<string, unknown>;
+}
+
+export function logAuxRun(record: AuxRunRecord): void {
+  try {
+    getDb()
+      .prepare(
+        `INSERT INTO aux_runs (service, model, group_folder, chat_jid, input_units, output_units, cost_usd, status, meta, run_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.service,
+        record.model || null,
+        record.groupFolder || null,
+        record.chatJid || null,
+        record.inputUnits || 0,
+        record.outputUnits || 0,
+        record.costUsd,
+        record.status || 'success',
+        record.meta ? JSON.stringify(record.meta) : null,
+        new Date().toISOString(),
+      );
+    logger.debug(
+      { service: record.service, cost: record.costUsd.toFixed(6) },
+      'Aux run logged',
+    );
+  } catch (err) {
+    logger.warn({ err, service: record.service }, 'Failed to log aux run');
+  }
+}
+
+// Pricing helpers exported for other modules
+export const FISH_AUDIO_USD_PER_BYTE = 15 / 1_000_000; // $15 / 1M UTF-8 bytes
+export const GPT_4O_MINI_INPUT_USD_PER_TOKEN = 0.15 / 1_000_000;
+export const GPT_4O_MINI_OUTPUT_USD_PER_TOKEN = 0.6 / 1_000_000;
+
+export function estimateFishAudioCost(text: string): number {
+  return Buffer.byteLength(text, 'utf-8') * FISH_AUDIO_USD_PER_BYTE;
+}
+
+export function estimateGpt4oMiniCost(
+  inputTokens: number,
+  outputTokens: number,
+): number {
+  return (
+    inputTokens * GPT_4O_MINI_INPUT_USD_PER_TOKEN +
+    outputTokens * GPT_4O_MINI_OUTPUT_USD_PER_TOKEN
+  );
+}
+
+// ---------------------------------------------------------------------------
 
 export function logAgentRun(record: AgentRunRecord): void {
   try {

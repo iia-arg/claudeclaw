@@ -60,6 +60,7 @@ async function transcribeTelegramAudio(
 }
 import { readEnvFile } from '../orchestrator/env.js';
 import { logger } from '../orchestrator/logger.js';
+import { GROUPS_DIR } from '../orchestrator/config.js';
 import { registerChannel, ChannelOpts } from '../orchestrator/channel-registry.js';
 import {
   Channel,
@@ -68,10 +69,81 @@ import {
   RegisteredGroup,
 } from '../orchestrator/types.js';
 
+/**
+ * Download a Telegram photo to the group images directory.
+ * Returns the saved file path, or null on failure.
+ */
+async function downloadTelegramPhoto(
+  fileId: string,
+  api: Api,
+  botToken: string,
+  groupFolder: string,
+  msgId: string,
+): Promise<string | null> {
+  try {
+    const fileInfo = await api.getFile(fileId);
+    if (!fileInfo.file_path) return null;
+    const url = `https://api.telegram.org/file/bot${botToken}/${fileInfo.file_path}`;
+
+    const imagesDir = path.join(GROUPS_DIR, groupFolder, 'images');
+    fs.mkdirSync(imagesDir, { recursive: true });
+
+    const ext = path.extname(fileInfo.file_path) || '.jpg';
+    const filename = `${Date.now()}_${msgId}${ext}`;
+    const destPath = path.join(imagesDir, filename);
+
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`download failed: ${resp.status}`);
+    fs.writeFileSync(destPath, Buffer.from(await resp.arrayBuffer()));
+
+    logger.info({ destPath, groupFolder }, 'Telegram photo saved');
+    return destPath;
+  } catch (err) {
+    logger.warn({ err: (err as Error).message, fileId }, 'Photo download failed');
+    return null;
+  }
+}
+
+/**
+ * Download a Telegram document/file to the group inbox directory.
+ * Returns the saved file path, or null on failure.
+ */
+async function downloadTelegramDocument(
+  fileId: string,
+  fileName: string,
+  api: Api,
+  botToken: string,
+  groupFolder: string,
+): Promise<string | null> {
+  try {
+    const fileInfo = await api.getFile(fileId);
+    if (!fileInfo.file_path) return null;
+    const url = `https://api.telegram.org/file/bot${botToken}/${fileInfo.file_path}`;
+
+    const inboxDir = path.join(GROUPS_DIR, groupFolder, 'inbox');
+    fs.mkdirSync(inboxDir, { recursive: true });
+
+    // Sanitize filename, keep original name for usability
+    const safeName = fileName.replace(/[^a-zA-Z0-9._\-а-яА-ЯёЁ ]/g, '_');
+    const destPath = path.join(inboxDir, `${Date.now()}_${safeName}`);
+
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`download failed: ${resp.status}`);
+    fs.writeFileSync(destPath, Buffer.from(await resp.arrayBuffer()));
+
+    logger.info({ destPath, groupFolder, fileName }, 'Telegram document saved');
+    return destPath;
+  } catch (err) {
+    logger.warn({ err: (err as Error).message, fileId, fileName }, 'Document download failed');
+    return null;
+  }
+}
+
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  autoRegisterPrivateChat?: (jid: string, name: string) => void;
 }
 
 /**
@@ -140,7 +212,13 @@ export class TelegramChannel implements Channel {
       // Skip commands
       if (ctx.message.text.startsWith('/')) return;
 
-      const chatJid = `tg:${ctx.chat.id}`;
+      const baseChatJid = `tg:${ctx.chat.id}`;
+      const threadId = ctx.message.message_thread_id;
+      // For forum topics, use tg:{chatId}:{threadId} as JID; fall back to base JID
+      const chatJid = threadId
+        ? `${baseChatJid}:${threadId}`
+        : baseChatJid;
+
       let content = ctx.message.text;
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
       const senderName =
@@ -158,8 +236,6 @@ export class TelegramChannel implements Channel {
           : (ctx.chat as any).title || chatJid;
 
       // Translate Telegram @bot_username mentions into TRIGGER_PATTERN format.
-      // Telegram @mentions (e.g., @andy_ai_bot) won't match TRIGGER_PATTERN
-      // (e.g., ^@Andy\b), so we prepend the trigger when the bot is @mentioned.
       const botUsername = ctx.me?.username?.toLowerCase();
       if (botUsername) {
         const entities = ctx.message.entities || [];
@@ -188,20 +264,35 @@ export class TelegramChannel implements Channel {
         isGroup,
       );
 
-      // Only deliver full message for registered groups
-      const group = this.opts.registeredGroups()[chatJid];
+      // Try topic JID first, then fall back to base chat JID
+      const groups = this.opts.registeredGroups();
+      const group = groups[chatJid] || groups[baseChatJid];
+      const effectiveJid = groups[chatJid] ? chatJid : baseChatJid;
+
       if (!group) {
-        logger.debug(
-          { chatJid, chatName },
-          'Message from unregistered Telegram chat',
-        );
-        return;
+        // Auto-register private chats if enabled
+        if (!isGroup && this.opts.autoRegisterPrivateChat) {
+          logger.info({ chatJid, chatName }, 'Auto-registering new private chat');
+          this.opts.autoRegisterPrivateChat(chatJid, chatName);
+          // Re-check after registration
+          const updatedGroups = this.opts.registeredGroups();
+          if (!updatedGroups[chatJid]) {
+            logger.warn({ chatJid }, 'Auto-registration failed, skipping message');
+            return;
+          }
+        } else {
+          logger.debug(
+            { chatJid, chatName },
+            'Message from unregistered Telegram chat',
+          );
+          return;
+        }
       }
 
       // Deliver message — startMessageLoop() will pick it up
-      this.opts.onMessage(chatJid, {
+      this.opts.onMessage(effectiveJid, {
         id: msgId,
-        chat_jid: chatJid,
+        chat_jid: effectiveJid,
         sender,
         sender_name: senderName,
         content,
@@ -210,15 +301,29 @@ export class TelegramChannel implements Channel {
       });
 
       logger.info(
-        { chatJid, chatName, sender: senderName },
+        { chatJid: effectiveJid, chatName, sender: senderName, threadId },
         'Telegram message stored',
       );
     });
 
     // Handle non-text messages with placeholders so the agent knows something was sent
     const storeNonText = (ctx: any, placeholder: string) => {
-      const chatJid = `tg:${ctx.chat.id}`;
-      const group = this.opts.registeredGroups()[chatJid];
+      const baseChatJid = `tg:${ctx.chat.id}`;
+      const threadId = ctx.message?.message_thread_id;
+      const topicJid = threadId ? `${baseChatJid}:${threadId}` : baseChatJid;
+      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      let groups = this.opts.registeredGroups();
+      let group = groups[topicJid] || groups[baseChatJid];
+      const chatJid = groups[topicJid] ? topicJid : baseChatJid;
+
+      // Auto-register private chats if enabled
+      if (!group && !isGroup && this.opts.autoRegisterPrivateChat) {
+        const chatName = ctx.chat.first_name || ctx.chat.username || baseChatJid;
+        logger.info({ chatJid: baseChatJid, chatName }, 'Auto-registering new private chat (non-text)');
+        this.opts.autoRegisterPrivateChat(baseChatJid, chatName);
+        groups = this.opts.registeredGroups();
+        group = groups[baseChatJid];
+      }
       if (!group) return;
 
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
@@ -229,8 +334,6 @@ export class TelegramChannel implements Channel {
         'Unknown';
       const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
 
-      const isGroup =
-        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
       this.opts.onChatMetadata(
         chatJid,
         timestamp,
@@ -249,7 +352,31 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
+    this.bot.on('message:photo', async (ctx) => {
+      // Resolve group with topic awareness — a chat can have multiple
+      // registered topics under the same chat_id, each with its own folder.
+      // Prefer a topic-specific match, fall back to the chat-level group.
+      const baseChatJid = `tg:${ctx.chat.id}`;
+      const threadId = ctx.message?.message_thread_id;
+      const topicJid = threadId ? `${baseChatJid}:${threadId}` : baseChatJid;
+      const groups = this.opts.registeredGroups();
+      const group = groups[topicJid] || groups[baseChatJid];
+      if (!group) return;
+
+      // Pick the highest resolution photo
+      const photos = ctx.message.photo;
+      const best = photos[photos.length - 1];
+      const msgId = ctx.message.message_id.toString();
+
+      const filePath = best?.file_id
+        ? await downloadTelegramPhoto(best.file_id, this.bot!.api, this.botToken, group.folder, msgId)
+        : null;
+
+      const placeholder = filePath
+        ? `[Photo: ${filePath}]`
+        : '[Photo]';
+      storeNonText(ctx, placeholder);
+    });
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
     this.bot.on('message:voice', async (ctx) => {
       const fileId = ctx.message.voice?.file_id;
@@ -271,9 +398,27 @@ export class TelegramChannel implements Channel {
         : '[Audio]';
       storeNonText(ctx, placeholder);
     });
-    this.bot.on('message:document', (ctx) => {
-      const name = ctx.message.document?.file_name || 'file';
-      storeNonText(ctx, `[Document: ${name}]`);
+    this.bot.on('message:document', async (ctx) => {
+      const doc = ctx.message.document;
+      const name = doc?.file_name || 'file';
+      const fileId = doc?.file_id;
+
+      // Determine group folder for this JID
+      const baseChatJid = `tg:${ctx.chat.id}`;
+      const threadId = ctx.message?.message_thread_id;
+      const topicJid = threadId ? `${baseChatJid}:${threadId}` : baseChatJid;
+      const groups = this.opts.registeredGroups();
+      const group = groups[topicJid] || groups[baseChatJid];
+
+      let filePath: string | null = null;
+      if (fileId && group) {
+        filePath = await downloadTelegramDocument(fileId, name, this.bot!.api, this.botToken, group.folder);
+      }
+
+      const placeholder = filePath
+        ? `[Document: ${name} saved to ${filePath}]`
+        : `[Document: ${name}]`;
+      storeNonText(ctx, placeholder);
     });
     this.bot.on('message:sticker', (ctx) => {
       const emoji = ctx.message.sticker?.emoji || '';
@@ -312,18 +457,25 @@ export class TelegramChannel implements Channel {
     }
 
     try {
-      const numericId = jid.replace(/^tg:/, '');
+      // Parse JID: tg:{chatId} or tg:{chatId}:{threadId}
+      const parts = jid.replace(/^tg:/, '').split(':');
+      const numericId = parts[0];
+      const threadId = parts[1] ? parseInt(parts[1], 10) : undefined;
+      const threadOptions = threadId ? { message_thread_id: threadId } : {};
+
+      logger.debug({ jid, numericId, threadId, threadOptions }, 'Sending Telegram message');
 
       // Telegram has a 4096 character limit per message — split if needed
       const MAX_LENGTH = 4096;
       if (text.length <= MAX_LENGTH) {
-        await sendTelegramMessage(this.bot.api, numericId, text);
+        await sendTelegramMessage(this.bot.api, numericId, text, threadOptions);
       } else {
         for (let i = 0; i < text.length; i += MAX_LENGTH) {
           await sendTelegramMessage(
             this.bot.api,
             numericId,
             text.slice(i, i + MAX_LENGTH),
+            threadOptions,
           );
         }
       }
@@ -352,8 +504,14 @@ export class TelegramChannel implements Channel {
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
     if (!this.bot || !isTyping) return;
     try {
-      const numericId = jid.replace(/^tg:/, '');
-      await this.bot.api.sendChatAction(numericId, 'typing');
+      const parts = jid.replace(/^tg:/, '').split(':');
+      const numericId = parts[0];
+      const threadId = parts[1] ? parseInt(parts[1], 10) : undefined;
+      await this.bot.api.sendChatAction(
+        numericId,
+        'typing',
+        threadId ? { message_thread_id: threadId } : {},
+      );
     } catch (err) {
       logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
     }
@@ -361,12 +519,30 @@ export class TelegramChannel implements Channel {
 }
 
 registerChannel('telegram', (opts: ChannelOpts) => {
-  const envVars = readEnvFile(['TELEGRAM_BOT_TOKEN']);
+  const envVars = readEnvFile(['TELEGRAM_BOT_TOKEN', 'TELEGRAM_AUTO_REGISTER_PRIVATE']);
   const token =
     process.env.TELEGRAM_BOT_TOKEN || envVars.TELEGRAM_BOT_TOKEN || '';
   if (!token) {
     logger.warn('Telegram: TELEGRAM_BOT_TOKEN not set');
     return null;
   }
-  return new TelegramChannel(token, opts);
+
+  // Auto-register private chats if enabled via env var
+  const autoRegisterEnabled = (process.env.TELEGRAM_AUTO_REGISTER_PRIVATE || envVars.TELEGRAM_AUTO_REGISTER_PRIVATE || 'false').toLowerCase() === 'true';
+
+  const autoRegisterPrivateChat = autoRegisterEnabled && opts.registerGroup
+    ? (jid: string, name: string) => {
+        opts.registerGroup!(jid, {
+          name,
+          folder: 'telegram_main',
+          trigger: `@${ASSISTANT_NAME}`,
+          added_at: new Date().toISOString(),
+          requiresTrigger: false,
+          agentConfig: { unsandboxed: true },
+        });
+        logger.info({ jid, name }, 'Auto-registered private chat');
+      }
+    : undefined;
+
+  return new TelegramChannel(token, { ...opts, autoRegisterPrivateChat });
 });

@@ -498,6 +498,173 @@ server.tool(
   },
 );
 
+// ---------------------------------------------------------------------------
+// Dynamic registration of extension tools (Instagram, Slack, etc.)
+//
+// Reads <groupIpc>/extension-tools.json (written by orchestrator before spawn).
+// For each tool:
+//   - converts JSON-schema-like inputSchema into a zod shape
+//   - registers a server.tool() that proxies the call via shared IPC dirs
+//     <DATA_DIR>/ipc/_tool-requests/  ←  request from this process
+//     <DATA_DIR>/ipc/_tool-responses/ ←  reply from orchestrator
+// ---------------------------------------------------------------------------
+
+type ManifestField =
+  | { type: 'string'; description?: string; required?: boolean; enum?: string[]; default?: string }
+  | { type: 'number'; description?: string; required?: boolean; default?: number }
+  | { type: 'boolean'; description?: string; required?: boolean; default?: boolean }
+  | { type: 'array'; items: 'string' | 'number'; description?: string; required?: boolean };
+
+interface ManifestTool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, ManifestField>;
+}
+
+function fieldToZod(field: ManifestField): z.ZodTypeAny {
+  let schema: z.ZodTypeAny;
+  switch (field.type) {
+    case 'string':
+      if (field.enum && field.enum.length > 0) {
+        schema = z.enum(field.enum as [string, ...string[]]);
+      } else {
+        schema = z.string();
+      }
+      break;
+    case 'number':
+      schema = z.number();
+      break;
+    case 'boolean':
+      schema = z.boolean();
+      break;
+    case 'array':
+      schema = z.array(field.items === 'number' ? z.number() : z.string());
+      break;
+  }
+  if (field.description) {
+    schema = schema.describe(field.description);
+  }
+  if (field.required === false || 'default' in field) {
+    schema = schema.optional();
+  }
+  if ('default' in field && field.default !== undefined) {
+    schema = (schema as any).default(field.default);
+  }
+  return schema;
+}
+
+function manifestToZodShape(
+  inputSchema: Record<string, ManifestField>,
+): Record<string, z.ZodTypeAny> {
+  const shape: Record<string, z.ZodTypeAny> = {};
+  for (const [key, field] of Object.entries(inputSchema)) {
+    shape[key] = fieldToZod(field);
+  }
+  return shape;
+}
+
+// IPC dirs used for the extension-tool bridge. The orchestrator writes its
+// data root into env via the runner; container path is the historical default.
+const EXT_TOOL_REQ_DIR = process.env.CLAUDECLAW_EXT_TOOL_REQ_DIR
+  || path.join(process.env.CLAUDECLAW_DATA_DIR || '/workspace/data', 'ipc', '_tool-requests');
+const EXT_TOOL_RESP_DIR = process.env.CLAUDECLAW_EXT_TOOL_RESP_DIR
+  || path.join(process.env.CLAUDECLAW_DATA_DIR || '/workspace/data', 'ipc', '_tool-responses');
+
+const EXT_TOOL_TIMEOUT_MS = 60_000;
+const EXT_TOOL_POLL_MS = 100;
+
+async function callExtensionTool(
+  toolName: string,
+  args: Record<string, unknown>,
+): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+  const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  fs.mkdirSync(EXT_TOOL_REQ_DIR, { recursive: true });
+  fs.mkdirSync(EXT_TOOL_RESP_DIR, { recursive: true });
+
+  const reqPath = path.join(EXT_TOOL_REQ_DIR, `${requestId}.json`);
+  const respPath = path.join(EXT_TOOL_RESP_DIR, `${requestId}.json`);
+
+  const payload = {
+    requestId,
+    tool: toolName,
+    args,
+    groupFolder,
+    chatJid,
+    isMain,
+  };
+  const tmp = `${reqPath}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(payload));
+  fs.renameSync(tmp, reqPath);
+
+  const deadline = Date.now() + EXT_TOOL_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(respPath)) {
+      try {
+        const raw = fs.readFileSync(respPath, 'utf-8');
+        fs.unlinkSync(respPath);
+        return JSON.parse(raw);
+      } catch (err) {
+        return { ok: false, error: `Bad response: ${String(err)}` };
+      }
+    }
+    await new Promise((r) => setTimeout(r, EXT_TOOL_POLL_MS));
+  }
+  // Timeout: clean up stray request file so orchestrator doesn't process late
+  try {
+    fs.unlinkSync(reqPath);
+  } catch {
+    /* ignore */
+  }
+  return { ok: false, error: `Extension tool timeout after ${EXT_TOOL_TIMEOUT_MS}ms` };
+}
+
+function registerExtensionTools(): void {
+  const ipcDir = process.env.CLAUDECLAW_IPC_DIR;
+  if (!ipcDir) return;
+  const manifestPath = path.join(ipcDir, 'extension-tools.json');
+  if (!fs.existsSync(manifestPath)) return;
+
+  let manifest: ManifestTool[];
+  try {
+    const raw = fs.readFileSync(manifestPath, 'utf-8');
+    manifest = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (!Array.isArray(manifest)) return;
+
+  for (const tool of manifest) {
+    if (!tool.name || typeof tool.name !== 'string') continue;
+    const shape = manifestToZodShape(tool.inputSchema || {});
+    server.tool(
+      tool.name,
+      tool.description || `Extension tool ${tool.name}`,
+      shape,
+      async (args: Record<string, unknown>) => {
+        const result = await callExtensionTool(tool.name, args);
+        if (!result.ok) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Error: ${result.error || 'Unknown extension tool error'}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        const text =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result, null, 2);
+        return { content: [{ type: 'text' as const, text }] };
+      },
+    );
+  }
+}
+
+registerExtensionTools();
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

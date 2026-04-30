@@ -39,6 +39,55 @@ export interface ExtensionHooks {
   postRoute?: (envelope: OutboundEnvelope) => void;
 }
 
+/**
+ * Field descriptor for an extension tool's input schema.
+ * JSON-serializable so it can be written to IPC and consumed by agent-runner,
+ * which converts it to zod schema at runtime when registering with the MCP server.
+ */
+export type ExtensionToolField =
+  | {
+      type: 'string';
+      description?: string;
+      required?: boolean;
+      enum?: string[];
+      default?: string;
+    }
+  | {
+      type: 'number';
+      description?: string;
+      required?: boolean;
+      default?: number;
+    }
+  | {
+      type: 'boolean';
+      description?: string;
+      required?: boolean;
+      default?: boolean;
+    }
+  | {
+      type: 'array';
+      items: 'string' | 'number';
+      description?: string;
+      required?: boolean;
+    };
+
+export interface ExtensionToolContext {
+  groupFolder: string;
+  chatJid: string;
+  isMain: boolean;
+}
+
+export interface ExtensionTool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, ExtensionToolField>;
+  /**
+   * Called by orchestrator's tool-bridge when agent invokes this tool.
+   * Return value is JSON-serialized and sent back to agent as tool result.
+   */
+  handler: (args: any, ctx: ExtensionToolContext) => Promise<any>;
+}
+
 export interface ClaudeClawExtension {
   name: string;
   ipcHandlers?: Record<string, IpcHandler>;
@@ -48,6 +97,12 @@ export interface ClaudeClawExtension {
   dbMigrations?: string[];
   envKeys?: string[];
   containerEnvKeys?: string[];
+  /**
+   * MCP tools exposed to the agent. Bridged via IPC: agent-runner registers
+   * each tool with its stdio MCP server; calls become tool-request files,
+   * orchestrator dispatches to handler, writes tool-response file.
+   */
+  tools?: ExtensionTool[];
 }
 
 const extensions: ClaudeClawExtension[] = [];
@@ -84,6 +139,10 @@ export function getExtensionDbSchema(): string[] {
 
 export function getExtensionDbMigrations(): string[] {
   return extensions.flatMap((e) => e.dbMigrations || []);
+}
+
+export function getExtensionTools(): ExtensionTool[] {
+  return extensions.flatMap((e) => e.tools || []);
 }
 
 export function callExtensionStartup(deps: ExtensionStartupDeps): void {

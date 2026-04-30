@@ -19,6 +19,10 @@ import {
   ensureSandboxRuntimeAvailable,
   runSandboxAgent,
 } from '../runtimes/sandbox-runner.js';
+import {
+  ensureDeepSeekAvailable,
+  runDeepSeekAgent,
+} from '../runtimes/deepseek-runner.js';
 // Channels loaded from src/index.ts;
 import {
   getChannelFactory,
@@ -54,6 +58,10 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
+import {
+  startExtensionToolBridge,
+  writeExtensionToolsManifest,
+} from './extension-tool-bridge.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { createMessageRouter } from './outbound-router.js';
 import { createMessageIngestion } from './ingestion.js';
@@ -385,6 +393,9 @@ async function runAgent(
     })),
   );
 
+  // Refresh extension-tools manifest so agent-runner sees current tool list
+  writeExtensionToolsManifest(group.folder);
+
   // Update available groups snapshot (main group only can see all groups)
   const availableGroups = getAvailableGroups();
   writeGroupsSnapshot(
@@ -401,7 +412,11 @@ async function runAgent(
   // Wrap onOutput to track session ID and usage from streamed results
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
+        // Defence-in-depth against stale-session resurrection: never persist a
+        // session id that arrived alongside an error status. If resume failed,
+        // the runner's catch handler may include the broken id we just tried —
+        // re-saving it would loop forever. Only trust ids on success.
+        if (output.newSessionId && output.status !== 'error') {
           sessions[group.folder] = output.newSessionId;
           setSession(group.folder, output.newSessionId);
         }
@@ -426,18 +441,23 @@ async function runAgent(
       queue.registerProcess(chatJid, proc, name, group.folder);
 
     const output =
-      runtime === 'sandbox'
-        ? await runSandboxAgent(group, agentInput, onProcessCb, wrappedOnOutput)
-        : await runContainerAgent(
-            group,
-            agentInput,
-            onProcessCb,
-            wrappedOnOutput,
-          );
+      runtime === 'deepseek'
+        ? await runDeepSeekAgent(group, agentInput, onProcessCb, wrappedOnOutput)
+        : runtime === 'sandbox'
+          ? await runSandboxAgent(group, agentInput, onProcessCb, wrappedOnOutput)
+          : await runContainerAgent(
+              group,
+              agentInput,
+              onProcessCb,
+              wrappedOnOutput,
+            );
 
     const durationMs = Date.now() - startTime;
 
-    if (output.newSessionId) {
+    // Same gate as the streaming wrapper: don't persist a session id that
+    // came back with status='error' — it's almost certainly the stale id we
+    // just tried to resume and got "No conversation found" on.
+    if (output.newSessionId && output.status !== 'error') {
       sessions[group.folder] = output.newSessionId;
       setSession(group.folder, output.newSessionId);
     }
@@ -447,9 +467,10 @@ async function runAgent(
     const turns = output.turns ?? lastTurns;
 
     if (output.status === 'error') {
+      const runtimeName = runtime === 'deepseek' ? 'DeepSeek' : runtime === 'sandbox' ? 'Sandbox' : 'Container';
       logger.error(
         { group: group.name, error: output.error },
-        `${runtime === 'sandbox' ? 'Sandbox' : 'Container'} agent error`,
+        `${runtimeName} agent error`,
       );
       return { status: 'error', usage, durationMs, turns };
     }
@@ -603,6 +624,9 @@ export async function main(): Promise<void> {
     allGroups.some(
       (g) => (g.runtime || DEFAULT_RUNTIME) === 'sandbox',
     );
+  const needsDeepSeek = allGroups.some(
+    (g) => g.runtime === 'deepseek',
+  );
 
   if (needsContainers) {
     ensureContainerSystemRunning();
@@ -610,6 +634,13 @@ export async function main(): Promise<void> {
   if (needsSandbox) {
     ensureSandboxRuntimeAvailable();
     cleanupSandboxOrphans();
+  }
+  if (needsDeepSeek) {
+    try {
+      await ensureDeepSeekAvailable();
+    } catch {
+      logger.warn('DeepSeek runtime requested but API key not configured');
+    }
   }
 
   loadState();
@@ -794,6 +825,10 @@ export async function main(): Promise<void> {
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
   });
+
+  // Bridge for extension-declared MCP tools: agent-runner sees them via
+  // <groupIpc>/extension-tools.json and invokes them through file-IPC.
+  startExtensionToolBridge();
   // Start webhook server if configured
   if (WEBHOOK_SECRET) {
     startWebhookServer(WEBHOOK_PORT, WEBHOOK_SECRET, {

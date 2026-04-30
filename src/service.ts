@@ -19,6 +19,7 @@ async function start(): Promise<void> {
   // Load built-in extensions (always present in core)
   await import('./cost-tracking/index.js');
   await import('./webhook/index.js');
+  await import('./voice/index.js');
 
   // Load installable extensions from extensions/ directory
   await loadExtensions();

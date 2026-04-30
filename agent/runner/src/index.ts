@@ -481,6 +481,14 @@ async function runQuery(
   // Apply per-group agent config overrides
   const agentCfg = containerInput.agentConfig;
 
+  // Resolve the ClaudeClaw repo root so MCP scripts can be located relative to
+  // the runner regardless of where the install lives on disk. mcpServerPath
+  // points at <root>/agent/runner/dist/ipc-mcp-stdio.js, so the root is three
+  // levels up. Allow env override for non-standard layouts.
+  const CLAUDECLAW_ROOT =
+    process.env.CLAUDECLAW_ROOT ||
+    path.resolve(path.dirname(mcpServerPath), '..', '..', '..');
+
   // If agentConfig has a systemPrompt, append it to globalClaudeMd
   if (agentCfg?.systemPrompt) {
     globalClaudeMd = globalClaudeMd
@@ -513,7 +521,11 @@ async function runQuery(
     'TeamCreate', 'TeamDelete', 'SendMessage',
     'TodoWrite', 'ToolSearch', 'Skill',
     'NotebookEdit',
-    'mcp__claudeclaw__*'
+    'mcp__claudeclaw__*',
+    'mcp__gmail__*',
+    'mcp__qmd__*',
+    'mcp__exchange__*',
+    'mcp__bitrix24__*'
   ];
   const allowedTools = agentCfg?.allowedTools && agentCfg.allowedTools.length > 0
     ? agentCfg.allowedTools
@@ -558,6 +570,49 @@ async function runQuery(
                   process.env.LIGHTRAG_API_KEY || 'local-lightrag-key',
                 LIGHTRAG_BASE_URL:
                   process.env.LIGHTRAG_BASE_URL || 'http://127.0.0.1:9621',
+              },
+            },
+          }
+        : {}),
+      ...(fs.existsSync(process.env.HOME + '/.gmail-mcp/credentials.json')
+        ? {
+            gmail: {
+              command: 'npx',
+              args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'],
+              env: {
+                HOME: process.env.HOME || '',
+              },
+            },
+          }
+        : {}),
+      ...(process.env.EXCHANGE_SERVER
+        ? {
+            exchange: {
+              command: 'python3',
+              args: [path.join(CLAUDECLAW_ROOT, 'src', 'exchange-mcp.py')],
+              env: {
+                EXCHANGE_SERVER: process.env.EXCHANGE_SERVER || '',
+                EXCHANGE_USERNAME: process.env.EXCHANGE_USERNAME || '',
+                EXCHANGE_PASSWORD: process.env.EXCHANGE_PASSWORD || '',
+                EXCHANGE_EMAIL: process.env.EXCHANGE_EMAIL || '',
+              },
+            },
+          }
+        : {}),
+      qmd: {
+        command: 'npx',
+        args: ['@tobilu/qmd', 'mcp'],
+        env: {
+          HOME: process.env.HOME || '',
+        },
+      },
+      ...(process.env.BITRIX24_WEBHOOK
+        ? {
+            bitrix24: {
+              command: 'python3',
+              args: [path.join(CLAUDECLAW_ROOT, 'src', 'bitrix24-mcp.py')],
+              env: {
+                BITRIX24_WEBHOOK: process.env.BITRIX24_WEBHOOK || '',
               },
             },
           }
@@ -746,10 +801,16 @@ async function main(): Promise<void> {
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
+    // Intentionally do NOT echo sessionId back on error.
+    // If the SDK threw on resume (e.g. "No conversation found with session ID"),
+    // `sessionId` here is the stale id that just blew up — re-emitting it would
+    // cause the host to persist it and re-attempt the same broken resume forever
+    // (stale-session resurrection bug). Any healthy newSessionId from a previous
+    // successful query in this run was already streamed via writeOutput on the
+    // 'result' message and on the per-iteration session-update at line ~769.
     writeOutput({
       status: 'error',
       result: null,
-      newSessionId: sessionId,
       error: errorMessage
     });
     process.exit(1);
