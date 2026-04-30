@@ -8,7 +8,7 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../orchestrator/types.js';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -28,6 +28,22 @@ type TranscribeResult =
   | { ok: false; reason: 'oversized'; sizeBytes: number }
   | { ok: false; reason: 'failed' };
 
+// Authentication mode: legacy webhook (REST URL with embedded secret) or OAuth (refreshable bearer).
+// OAuth is the supported path; webhook remains as a deprecated fallback for installs that haven't migrated yet.
+type BxAuth =
+  | { mode: 'webhook'; webhookUrl: string }
+  | {
+      mode: 'oauth';
+      clientEndpoint: string; // e.g. "https://<portal>/rest/" — note trailing slash
+      accessToken: string;
+      refreshToken: string;
+      clientId: string;
+      clientSecret: string;
+    };
+
+// OAuth refresh endpoint is portal-independent; client_endpoint in the response may update if Bitrix migrates the portal.
+const OAUTH_REFRESH_URL = 'https://oauth.bitrix.info/oauth/token';
+
 const POLL_INTERVAL_MS = 15_000;
 // How often to scan im.recent.list for new group chats (every N polls)
 const GROUP_DISCOVER_EVERY = 4;
@@ -43,7 +59,7 @@ const dialogIdForJid = (jid: string): string => {
 export class Bitrix24Channel implements Channel {
   name = 'bitrix24';
 
-  private webhookUrl: string;
+  private auth: BxAuth;
   private allowedUserId: string;  // our main user (Alexander)
   private botUserId: string;      // our own bot user ID (to skip own messages)
   private extraAllowedUserIds: Set<string>; // authorized team members who can message the bot directly
@@ -58,9 +74,11 @@ export class Bitrix24Channel implements Channel {
   // known group chat IDs (chatId as string, e.g. "182364")
   private knownGroupChatIds: Set<string> = new Set();
   private pollCount = 0;
+  // Inflight refresh promise — coalesce concurrent 401s so only one refresh fires.
+  private refreshInflight: Promise<boolean> | null = null;
 
   constructor(
-    webhookUrl: string,
+    auth: BxAuth,
     allowedUserId: string,
     botUserId: string,
     opts: {
@@ -70,21 +88,127 @@ export class Bitrix24Channel implements Channel {
     },
     extraAllowedUserIds: string[] = [],
   ) {
-    this.webhookUrl = webhookUrl;
+    this.auth = auth;
     this.allowedUserId = allowedUserId;
     this.botUserId = botUserId;
     this.extraAllowedUserIds = new Set(extraAllowedUserIds);
     this.opts = opts;
   }
 
-  private async b24(method: string, params: Record<string, unknown> = {}): Promise<any> {
-    const url = `${this.webhookUrl}${method}`;
+  private buildUrl(method: string): string {
+    if (this.auth.mode === 'webhook') {
+      return `${this.auth.webhookUrl}${method}`;
+    }
+    // OAuth: client_endpoint always ends with trailing slash; auth goes as query param
+    return `${this.auth.clientEndpoint}${method}?auth=${encodeURIComponent(this.auth.accessToken)}`;
+  }
+
+  private async b24(method: string, params: Record<string, unknown> = {}, retried = false): Promise<any> {
+    const url = this.buildUrl(method);
     const resp = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
     });
-    return resp.json();
+    const data: any = await resp.json().catch(() => ({}));
+
+    // OAuth-only: refresh on expired_token / invalid_token then retry once.
+    if (
+      this.auth.mode === 'oauth' &&
+      !retried &&
+      (data?.error === 'expired_token' ||
+        data?.error === 'invalid_token' ||
+        resp.status === 401)
+    ) {
+      logger.info({ method, error: data?.error }, 'Bitrix24: access token expired, refreshing');
+      const ok = await this.ensureRefreshed();
+      if (ok) return this.b24(method, params, true);
+    }
+    return data;
+  }
+
+  /** Coalesce concurrent refresh calls so only one round-trip hits the OAuth server. */
+  private ensureRefreshed(): Promise<boolean> {
+    if (this.refreshInflight) return this.refreshInflight;
+    this.refreshInflight = this.refreshOAuth().finally(() => {
+      this.refreshInflight = null;
+    });
+    return this.refreshInflight;
+  }
+
+  private async refreshOAuth(): Promise<boolean> {
+    if (this.auth.mode !== 'oauth') return false;
+    try {
+      const qs = new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: this.auth.clientId,
+        client_secret: this.auth.clientSecret,
+        refresh_token: this.auth.refreshToken,
+      });
+      const resp = await fetch(`${OAUTH_REFRESH_URL}?${qs.toString()}`, { method: 'GET' });
+      const data: any = await resp.json().catch(() => ({}));
+      if (!data?.access_token || !data?.refresh_token) {
+        logger.error(
+          { status: resp.status, error: data?.error, errorDescription: data?.error_description },
+          'Bitrix24: OAuth refresh failed (no tokens in response)',
+        );
+        return false;
+      }
+      this.auth.accessToken = data.access_token;
+      this.auth.refreshToken = data.refresh_token;
+      if (typeof data.client_endpoint === 'string' && data.client_endpoint) {
+        this.auth.clientEndpoint = data.client_endpoint;
+      }
+      logger.info({ expiresIn: data.expires_in }, 'Bitrix24: OAuth tokens refreshed');
+      // Best-effort persistence so subsequent service restarts pick up the new tokens.
+      await this.persistOAuthTokens();
+      return true;
+    } catch (err) {
+      logger.error({ err }, 'Bitrix24: OAuth refresh threw');
+      return false;
+    }
+  }
+
+  /** Write refreshed tokens back to pass-store. Best-effort: failure logs WARN but doesn't block. */
+  private async persistOAuthTokens(): Promise<void> {
+    if (this.auth.mode !== 'oauth') return;
+    const writeOne = (entry: string, value: string) =>
+      new Promise<{ ok: boolean; stderr: string }>((resolve) => {
+        const child = spawn('pass', ['insert', '-m', '-f', entry], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          // Inherit env so GPG_AGENT_INFO / HOME flow through.
+          env: process.env,
+        });
+        let stderr = '';
+        child.stderr.on('data', (chunk) => {
+          stderr += chunk.toString();
+        });
+        child.on('error', (err) => {
+          resolve({ ok: false, stderr: String(err) });
+        });
+        child.on('exit', (code) => {
+          resolve({ ok: code === 0, stderr });
+        });
+        // `pass insert -m` reads multi-line content from stdin until EOF.
+        child.stdin.write(value + '\n');
+        child.stdin.end();
+      });
+
+    const accessRes = await writeOne('bitrix24/oauth-access-token', this.auth.accessToken);
+    const refreshRes = await writeOne('bitrix24/oauth-refresh-token', this.auth.refreshToken);
+    if (accessRes.ok && refreshRes.ok) {
+      logger.info('Bitrix24: refreshed OAuth tokens persisted to pass-store');
+    } else {
+      logger.warn(
+        {
+          accessOk: accessRes.ok,
+          refreshOk: refreshRes.ok,
+          accessErr: accessRes.stderr.slice(0, 200),
+          refreshErr: refreshRes.stderr.slice(0, 200),
+        },
+        'Bitrix24: failed to persist refreshed tokens to pass-store (in-memory copy still valid for this session)',
+      );
+    }
   }
 
   async connect(): Promise<void> {
@@ -583,25 +707,64 @@ export class Bitrix24Channel implements Channel {
 }
 
 registerChannel('bitrix24', (opts: ChannelOpts) => {
-  const envVars = readEnvFile(['BITRIX24_WEBHOOK', 'BITRIX24_ALLOWED_USER_ID', 'BITRIX24_BOT_USER_ID', 'BITRIX24_EXTRA_USER_IDS']);
-  const webhook =
-    process.env.BITRIX24_WEBHOOK || envVars.BITRIX24_WEBHOOK || '';
-  const allowedUserId =
-    process.env.BITRIX24_ALLOWED_USER_ID || envVars.BITRIX24_ALLOWED_USER_ID || '226';
-  const botUserId =
-    process.env.BITRIX24_BOT_USER_ID || envVars.BITRIX24_BOT_USER_ID || '3273';
+  const envVars = readEnvFile([
+    'BITRIX24_WEBHOOK',
+    'BITRIX24_CLIENT_ENDPOINT',
+    'BITRIX24_ACCESS_TOKEN',
+    'BITRIX24_REFRESH_TOKEN',
+    'BITRIX24_CLIENT_ID',
+    'BITRIX24_CLIENT_SECRET',
+    'BITRIX24_ALLOWED_USER_ID',
+    'BITRIX24_BOT_USER_ID',
+    'BITRIX24_EXTRA_USER_IDS',
+  ]);
+  const pick = (k: string) => process.env[k] || envVars[k] || '';
+
+  const allowedUserId = pick('BITRIX24_ALLOWED_USER_ID') || '226';
+  const botUserId = pick('BITRIX24_BOT_USER_ID') || '3273';
   // Default: board of directors + direct team (Bitrix24 user IDs)
   const DEFAULT_EXTRA_USER_IDS = '218,753,5,220,662,2419,2693,73,2581,54,1760,65,926,274,2514,2555,1680,1657,3236,2018,13,777,2475,56,219,2360,58,1266,1889,1232,690,64,3130';
-  const extraUserIdsRaw =
-    process.env.BITRIX24_EXTRA_USER_IDS || envVars.BITRIX24_EXTRA_USER_IDS || DEFAULT_EXTRA_USER_IDS;
+  const extraUserIdsRaw = pick('BITRIX24_EXTRA_USER_IDS') || DEFAULT_EXTRA_USER_IDS;
   const extraAllowedUserIds = extraUserIdsRaw
     ? extraUserIdsRaw.split(',').map((s) => s.trim()).filter(Boolean)
     : [];
 
-  if (!webhook) {
-    logger.warn('Bitrix24: BITRIX24_WEBHOOK not set, channel disabled');
+  // OAuth path is preferred. All OAuth env vars must be present together.
+  const oauthEndpoint = pick('BITRIX24_CLIENT_ENDPOINT');
+  const accessToken = pick('BITRIX24_ACCESS_TOKEN');
+  const refreshToken = pick('BITRIX24_REFRESH_TOKEN');
+  const clientId = pick('BITRIX24_CLIENT_ID');
+  const clientSecret = pick('BITRIX24_CLIENT_SECRET');
+  const oauthReady =
+    oauthEndpoint && accessToken && refreshToken && clientId && clientSecret;
+
+  let auth: BxAuth | null = null;
+  if (oauthReady) {
+    // Normalize: client_endpoint must end with a trailing slash so `${endpoint}${method}` is well-formed.
+    const ep = oauthEndpoint.endsWith('/') ? oauthEndpoint : oauthEndpoint + '/';
+    auth = {
+      mode: 'oauth',
+      clientEndpoint: ep,
+      accessToken,
+      refreshToken,
+      clientId,
+      clientSecret,
+    };
+    logger.info({ endpoint: ep }, 'Bitrix24: OAuth mode (published-app credentials)');
+  } else {
+    const webhook = pick('BITRIX24_WEBHOOK');
+    if (webhook) {
+      auth = { mode: 'webhook', webhookUrl: webhook };
+      logger.warn(
+        'Bitrix24: using legacy webhook auth — consider migrating to OAuth (set BITRIX24_CLIENT_ENDPOINT/ACCESS_TOKEN/REFRESH_TOKEN/CLIENT_ID/CLIENT_SECRET)',
+      );
+    }
+  }
+
+  if (!auth) {
+    logger.info('Bitrix24: no credentials configured (OAuth or webhook), channel disabled');
     return null;
   }
 
-  return new Bitrix24Channel(webhook, allowedUserId, botUserId, opts, extraAllowedUserIds);
+  return new Bitrix24Channel(auth, allowedUserId, botUserId, opts, extraAllowedUserIds);
 });
