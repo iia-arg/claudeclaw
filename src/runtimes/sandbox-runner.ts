@@ -450,6 +450,8 @@ export async function runSandboxAgent(
       'ANTHROPIC_API_KEY',
       'CLAUDE_CODE_OAUTH_TOKEN',
       'ANTHROPIC_AUTH_TOKEN',
+      'HOMEASSISTANT_LLAT',
+      'HOMEASSISTANT_BASE_URL',
     ]);
 
     const child = spawn(sandboxArgs[0], sandboxArgs.slice(1), {
@@ -465,6 +467,12 @@ export async function runSandboxAgent(
                 secrets.ANTHROPIC_AUTH_TOKEN ||
                 '',
             }),
+        ...(secrets.HOMEASSISTANT_LLAT
+          ? { HOMEASSISTANT_LLAT: secrets.HOMEASSISTANT_LLAT }
+          : {}),
+        ...(secrets.HOMEASSISTANT_BASE_URL
+          ? { HOMEASSISTANT_BASE_URL: secrets.HOMEASSISTANT_BASE_URL }
+          : {}),
         ...pathEnv,
       },
     });

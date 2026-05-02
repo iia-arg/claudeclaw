@@ -525,7 +525,8 @@ async function runQuery(
     'mcp__gmail__*',
     'mcp__qmd__*',
     'mcp__exchange__*',
-    'mcp__bitrix24__*'
+    'mcp__bitrix24__*',
+    'mcp__homeassistant__*'
   ];
   const allowedTools = agentCfg?.allowedTools && agentCfg.allowedTools.length > 0
     ? agentCfg.allowedTools
@@ -613,6 +614,17 @@ async function runQuery(
               args: [path.join(CLAUDECLAW_ROOT, 'src', 'bitrix24-mcp.py')],
               env: {
                 BITRIX24_WEBHOOK: process.env.BITRIX24_WEBHOOK || '',
+              },
+            },
+          }
+        : {}),
+      ...(process.env.HOMEASSISTANT_LLAT && process.env.HOMEASSISTANT_BASE_URL
+        ? {
+            homeassistant: {
+              type: 'sse' as const,
+              url: `${process.env.HOMEASSISTANT_BASE_URL.replace(/\/$/, '')}/mcp_server/sse`,
+              headers: {
+                Authorization: `Bearer ${process.env.HOMEASSISTANT_LLAT}`,
               },
             },
           }
