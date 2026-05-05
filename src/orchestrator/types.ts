@@ -122,6 +122,15 @@ export interface Channel {
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
+  /**
+   * Optional: stop accepting INCOMING messages while keeping the OUTBOUND
+   * path alive. Used in shutdown to prevent new work entering the queue
+   * while the queue drains and agents flush their final replies through
+   * still-live channels. Channels without this fall back to full
+   * disconnect() at shutdown step 1 (legacy behaviour — may lose final
+   * outgoing messages from agents that were mid-reply).
+   */
+  pauseInbound?(): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.

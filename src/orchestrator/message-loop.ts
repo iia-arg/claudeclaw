@@ -724,11 +724,17 @@ export async function main(): Promise<void> {
 
   // Graceful shutdown handlers — owns ALL signal handling for the service.
   // Order matters:
-  //   1) flip queue.shuttingDown so no new work enqueues
-  //   2) abort channel long-polls (Telegram getUpdates, Bitrix24, Gmail) so
-  //      no new messages arrive mid-shutdown and active fetches resolve
-  //   3) drain queue.shutdown(): sends _close IPC to active agent runners,
-  //      they finish their grace window and exit, MCP children EOF and die
+  //   1) pause INBOUND on every channel (Telegram getUpdates aborts, Bitrix
+  //      polling stops, Gmail polling stops). Outbound stays alive so
+  //      agents can still deliver their final replies. Channels without
+  //      pauseInbound() fall back to full disconnect() here — legacy
+  //      behaviour, may drop in-flight outgoing.
+  //   2) drain queue.shutdown(): sends _close IPC to active agent runners,
+  //      they finish their grace window. Final replies route through the
+  //      still-live outbound path → no more "No connected channel" warns.
+  //   3) full channel disconnect — for channels that supported pauseInbound,
+  //      now tear down the api/socket. (For legacy channels this is a
+  //      no-op since they were already disconnected in step 1.)
   //   4) close credential proxy
   //   5) exit(0) — service.ts's process.on('exit') hook releases PID-lock
   //
@@ -739,14 +745,25 @@ export async function main(): Promise<void> {
     if (shuttingDown) return; // signal can re-fire; ignore
     shuttingDown = true;
     logger.info({ signal }, 'Shutdown signal received — draining');
-    // Step 1+2: stop channels FIRST so getUpdates long-polls abort and no
-    // fresh messages enter the queue while we're draining.
-    try {
-      for (const ch of channels) await ch.disconnect();
-    } catch (err) {
-      logger.warn({ err }, 'Channel disconnect raised — continuing shutdown');
+    // Step 1: stop accepting NEW incoming, but keep outbound alive.
+    // Channels that don't implement pauseInbound get a hard disconnect here
+    // (legacy fallback — risks losing final outgoing, but matches old behaviour).
+    for (const ch of channels) {
+      try {
+        if (ch.pauseInbound) {
+          await ch.pauseInbound();
+        } else {
+          await ch.disconnect();
+        }
+      } catch (err) {
+        logger.warn(
+          { err, channel: ch.name },
+          'Channel pauseInbound/disconnect raised — continuing shutdown',
+        );
+      }
     }
-    // Step 3: drain in-flight agent runs.
+    // Step 2: drain in-flight agent runs. Their final replies still reach
+    // Telegram because pauseInbound() didn't kill the api object.
     await queue.shutdown(45000);
     const remainingActive = queue.getActiveCount();
     if (remainingActive > 0) {
@@ -758,6 +775,19 @@ export async function main(): Promise<void> {
         },
         'message deferred for retry after shutdown grace expired',
       );
+    }
+    // Step 3: now fully disconnect channels that supported the split.
+    // (Channels without pauseInbound were already disconnected in step 1.)
+    for (const ch of channels) {
+      if (!ch.pauseInbound) continue;
+      try {
+        await ch.disconnect();
+      } catch (err) {
+        logger.warn(
+          { err, channel: ch.name },
+          'Channel disconnect raised after drain — continuing shutdown',
+        );
+      }
     }
     // Step 4: credential proxy (only running in container mode).
     proxyServer?.close();

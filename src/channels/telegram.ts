@@ -389,6 +389,7 @@ export class TelegramChannel implements Channel {
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
   private botToken: string;
+  private inboundPaused = false;
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
@@ -835,9 +836,36 @@ export class TelegramChannel implements Channel {
     return jid.startsWith('tg:');
   }
 
+  /**
+   * Stop the long-poll loop (so getUpdates aborts and no new incoming
+   * messages enter the orchestrator) WITHOUT tearing down the api object.
+   * `isConnected()` continues to report true, so the outbound router can
+   * still deliver the final replies that agents finish during the
+   * shutdown drain. Idempotent — safe to call before disconnect().
+   */
+  async pauseInbound(): Promise<void> {
+    if (this.bot && !this.inboundPaused) {
+      this.inboundPaused = true;
+      try {
+        await this.bot.stop();
+      } catch (err) {
+        logger.warn({ err }, 'bot.stop() raised during pauseInbound');
+      }
+      logger.info('Telegram inbound paused (api still live for outbound drain)');
+    }
+  }
+
   async disconnect(): Promise<void> {
     if (this.bot) {
-      this.bot.stop();
+      // If pauseInbound() already stopped the poller, bot.stop() is a
+      // safe no-op the second time.
+      if (!this.inboundPaused) {
+        try {
+          await this.bot.stop();
+        } catch (err) {
+          logger.warn({ err }, 'bot.stop() raised during disconnect');
+        }
+      }
       this.bot = null;
       logger.info('Telegram bot stopped');
     }
