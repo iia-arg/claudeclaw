@@ -79,8 +79,19 @@ function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Trigger pattern matches the assistant name anywhere in the message as a
+// whole word. We use Cyrillic-aware lookarounds instead of \b because in
+// JavaScript V8 \b is ASCII-only and gives wrong results around Cyrillic.
+//   - "@Забава, помоги"  → match
+//   - "помоги, Забава"   → match
+//   - "Забава"           → match (single-word call)
+//   - "ЗАБАВА"           → match (case-insensitive via /i)
+//   - "забавный котик"   → no match (next char "н" is a Cyrillic letter)
+//   - "Незабавно"        → no match (prev char "е" is a Cyrillic letter)
+// The previous tighter pattern (`^@Забава\b`) only matched at line start,
+// which broke usage like "помоги, Забава".
 export const TRIGGER_PATTERN = new RegExp(
-  `^@${escapeRegex(ASSISTANT_NAME)}\\b`,
+  `(?<![A-Za-zА-Яа-яЁё])${escapeRegex(ASSISTANT_NAME)}(?![A-Za-zА-Яа-яЁё])`,
   'i',
 );
 
