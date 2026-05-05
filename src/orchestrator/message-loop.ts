@@ -263,17 +263,26 @@ async function processGroupMessages(chatJid: string, router: MessageRouter): Pro
   // or equivalent). We DO NOT register a per-thread group anymore: thread/JID
   // expansion caused "fresh agent every reply" amnesia and bloated the DB with
   // thousands of orphan rows. Visual reply works via opts.replyTo on the
-  // channel instead, with no DB side-effect. Each new turn still requires a
-  // trigger word (or a Telegram reply on the bot's message — caught upstream).
-  const triggerMsg = missedMessages.find((m) =>
-    TRIGGER_PATTERN.test(m.content.trim()),
+  // channel instead, with no DB side-effect.
+  //
+  // Two regimes:
+  //   • requiresTrigger=true  — the visual anchor is the message that contains
+  //     the trigger pattern (so the bot's reply visibly answers that explicit
+  //     summons).
+  //   • requiresTrigger=false — every incoming message is implicitly a
+  //     trigger (DM, main group, !жизнь generals). Anchor on the LAST
+  //     non-bot incoming message instead, so multi-message replies in noisy
+  //     chats stay visually linked to what the user just said.
+  const incomingFromUser = missedMessages.filter(
+    (m) => !m.is_from_me && !m.is_bot_message,
   );
+  const triggerMsg =
+    group.requiresTrigger !== false
+      ? missedMessages.find((m) => TRIGGER_PATTERN.test(m.content.trim()))
+      : incomingFromUser[incomingFromUser.length - 1];
   const replyJid = chatJid;
   const agentGroup = group;
-  const replyToMessageId =
-    triggerMsg && group.requiresTrigger !== false
-      ? Number(triggerMsg.id)
-      : undefined;
+  const replyToMessageId = triggerMsg ? Number(triggerMsg.id) : undefined;
 
   await channel.setTyping?.(replyJid, true);
   let hadError = false;

@@ -358,8 +358,14 @@ async function sendTelegramMessage(
     });
     return sent?.message_id;
   } catch (err) {
-    // Fallback: send as plain text if Markdown parsing fails
-    logger.debug({ err }, 'Markdown send failed, falling back to plain text');
+    // Fallback: send as plain text if Markdown parsing fails. Bumped from
+    // logger.debug to logger.warn so silent formatting drops are visible
+    // in production logs — every fallback means the user saw raw `*bold*`
+    // / `_italic_` / `[link](url)` and we want to know it happened.
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Markdown send failed, falling back to plain text',
+    );
     const sent = await api.sendMessage(chatId, text, options);
     return sent?.message_id;
   }
