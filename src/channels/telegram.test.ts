@@ -778,10 +778,10 @@ describe('TelegramChannel', () => {
         new Error('Network error'),
       );
 
-      // Should not throw
+      // Should not throw, and should report no message ids on failure.
       await expect(
         channel.sendMessage('tg:100200300', 'Will fail'),
-      ).resolves.toBeUndefined();
+      ).resolves.toEqual({ messageIds: [] });
     });
 
     it('does nothing when bot is not initialized', async () => {

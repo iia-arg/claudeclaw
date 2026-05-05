@@ -156,9 +156,10 @@ export class GmailChannel implements Channel {
     }
   }
 
-  async sendMessage(_jid: string, _text: string, _opts?: { replyTo?: { messageId: number } }): Promise<void> {
+  async sendMessage(_jid: string, _text: string, _opts?: { replyTo?: { messageId: number } }): Promise<{ messageIds: string[] }> {
     // Gmail responses are handled via mcp__gmail__* tools by the agent itself
     logger.debug('Gmail channel: sendMessage is a no-op (agent uses MCP tools directly)');
+    return { messageIds: [] };
   }
 
   isConnected(): boolean {

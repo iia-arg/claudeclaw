@@ -350,16 +350,18 @@ async function sendTelegramMessage(
     message_thread_id?: number;
     reply_parameters?: { message_id: number; allow_sending_without_reply?: boolean };
   } = {},
-): Promise<void> {
+): Promise<number | undefined> {
   try {
-    await api.sendMessage(chatId, text, {
+    const sent = await api.sendMessage(chatId, text, {
       ...options,
       parse_mode: 'Markdown',
     });
+    return sent?.message_id;
   } catch (err) {
     // Fallback: send as plain text if Markdown parsing fails
     logger.debug({ err }, 'Markdown send failed, falling back to plain text');
-    await api.sendMessage(chatId, text, options);
+    const sent = await api.sendMessage(chatId, text, options);
+    return sent?.message_id;
   }
 }
 
@@ -749,12 +751,13 @@ export class TelegramChannel implements Channel {
     jid: string,
     text: string,
     opts?: { replyTo?: { messageId: number } },
-  ): Promise<void> {
+  ): Promise<{ messageIds: string[] }> {
     if (!this.bot) {
       logger.warn('Telegram bot not initialized');
-      return;
+      return { messageIds: [] };
     }
 
+    const messageIds: string[] = [];
     try {
       // Parse JID: tg:{chatId} or tg:{chatId}:{threadId}
       // threadId here = forum-topic id (only set for forum supergroups, e.g. !жизнь).
@@ -781,24 +784,30 @@ export class TelegramChannel implements Channel {
       // message multiple times produces visual clutter).
       const MAX_LENGTH = 4096;
       if (text.length <= MAX_LENGTH) {
-        await sendTelegramMessage(this.bot.api, numericId, text, sendOptions);
+        const id = await sendTelegramMessage(this.bot.api, numericId, text, sendOptions);
+        if (id !== undefined) messageIds.push(String(id));
       } else {
         const firstChunkOptions = sendOptions;
         const restOptions = { ...sendOptions };
         delete restOptions.reply_parameters;
         for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await sendTelegramMessage(
+          const id = await sendTelegramMessage(
             this.bot.api,
             numericId,
             text.slice(i, i + MAX_LENGTH),
             i === 0 ? firstChunkOptions : restOptions,
           );
+          if (id !== undefined) messageIds.push(String(id));
         }
       }
-      logger.info({ jid, length: text.length }, 'Telegram message sent');
+      logger.info(
+        { jid, length: text.length, messageIds },
+        'Telegram message sent',
+      );
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Telegram message');
     }
+    return { messageIds };
   }
 
   isConnected(): boolean {
