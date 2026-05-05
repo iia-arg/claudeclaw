@@ -40,9 +40,12 @@ interface GroupState {
   // Cleared automatically when the registered process exits, or by runForGroup/
   // runTask's finally block. `timedOut` survives across the run so message-loop
   // can pick it up for status='timeout' on the agent_runs row.
+  // runTimeoutMs is the saved budget so we can re-arm the timer when a new
+  // IPC message wakes an idle runner (variant A: cancel-on-idle, arm-on-msg).
   timeoutTimer: NodeJS.Timeout | null;
   killTimer: NodeJS.Timeout | null;
   timedOut: boolean;
+  runTimeoutMs: number | null;
 }
 
 // Grace period between SIGTERM and SIGKILL when timing out a runner.
@@ -135,6 +138,7 @@ export class GroupQueue {
         timeoutTimer: null,
         killTimer: null,
         timedOut: false,
+        runTimeoutMs: null,
       };
       this.groups.set(groupJid, state);
     }
@@ -224,30 +228,13 @@ export class GroupQueue {
 
     // Reset per-run timeout flag; previous run's flag must not bleed in.
     state.timedOut = false;
+    state.runTimeoutMs = null;
 
     if (typeof timeoutMs === 'number' && timeoutMs > 0 && typeof proc.kill === 'function') {
-      state.timeoutTimer = setTimeout(() => {
-        state.timedOut = true;
-        logger.warn(
-          { groupJid, containerName, timeoutMs },
-          'Runner exceeded hard timeout — sending SIGTERM',
-        );
-        try { proc.kill('SIGTERM'); } catch (err) {
-          logger.warn({ groupJid, err }, 'SIGTERM failed');
-        }
-        // Grace period, then escalate to SIGKILL if still alive.
-        state.killTimer = setTimeout(() => {
-          if (proc.exitCode === null && proc.signalCode === null) {
-            logger.warn(
-              { groupJid, containerName, graceMs: TIMEOUT_KILL_GRACE_MS },
-              'Runner did not exit after SIGTERM — escalating to SIGKILL',
-            );
-            try { proc.kill('SIGKILL'); } catch (err) {
-              logger.warn({ groupJid, err }, 'SIGKILL failed');
-            }
-          }
-        }, TIMEOUT_KILL_GRACE_MS);
-      }, timeoutMs);
+      // Save the budget so notifyIdle/sendMessage can re-arm a fresh timer
+      // when the runner wakes back up after going idle.
+      state.runTimeoutMs = timeoutMs;
+      this.armRunTimeout(state, proc, groupJid, containerName);
 
       // Clear timers as soon as the process exits — whether normal exit, our
       // SIGTERM, an unrelated SIGKILL, or anything else. Without this we'd
@@ -257,6 +244,52 @@ export class GroupQueue {
         proc.once('exit', () => this.clearTimeoutTimers(state));
       }
     }
+  }
+
+  /**
+   * Arm the per-run hard timeout: SIGTERM after `timeoutMs`, escalate to
+   * SIGKILL after a grace period if the process is still alive. Idempotent —
+   * if a timer is already armed, it is replaced. Variant A semantics: we
+   * cancel on `notifyIdle` (runner is just waiting for the next message,
+   * shouldn't count against the budget) and re-arm on `sendMessage`
+   * (a new turn just started, the budget applies again).
+   */
+  private armRunTimeout(
+    state: GroupState,
+    proc: ChildProcess,
+    groupJid: string,
+    containerName: string | null,
+  ): void {
+    const timeoutMs = state.runTimeoutMs;
+    if (typeof timeoutMs !== 'number' || timeoutMs <= 0) return;
+
+    if (state.timeoutTimer) {
+      clearTimeout(state.timeoutTimer);
+      state.timeoutTimer = null;
+    }
+
+    state.timeoutTimer = setTimeout(() => {
+      state.timedOut = true;
+      logger.warn(
+        { groupJid, containerName, timeoutMs },
+        'Runner exceeded hard timeout — sending SIGTERM',
+      );
+      try { proc.kill('SIGTERM'); } catch (err) {
+        logger.warn({ groupJid, err }, 'SIGTERM failed');
+      }
+      // Grace period, then escalate to SIGKILL if still alive.
+      state.killTimer = setTimeout(() => {
+        if (proc.exitCode === null && proc.signalCode === null) {
+          logger.warn(
+            { groupJid, containerName, graceMs: TIMEOUT_KILL_GRACE_MS },
+            'Runner did not exit after SIGTERM — escalating to SIGKILL',
+          );
+          try { proc.kill('SIGKILL'); } catch (err) {
+            logger.warn({ groupJid, err }, 'SIGKILL failed');
+          }
+        }
+      }, TIMEOUT_KILL_GRACE_MS);
+    }, timeoutMs);
   }
 
   private clearTimeoutTimers(state: GroupState): void {
@@ -282,6 +315,16 @@ export class GroupQueue {
   notifyIdle(groupJid: string): void {
     const state = this.getGroup(groupJid);
     state.idleWaiting = true;
+    // Variant A: cancel the per-run hard timeout while we're idle.
+    // The runner is just sitting on its open MessageStream waiting for the
+    // next message; it isn't doing any work and shouldn't count against the
+    // 8/15-min budget. We re-arm in sendMessage when a new turn starts.
+    // Don't touch killTimer — if SIGTERM has already fired, the grace
+    // period must run to completion regardless of idle status.
+    if (!state.timedOut && state.timeoutTimer) {
+      clearTimeout(state.timeoutTimer);
+      state.timeoutTimer = null;
+    }
     if (state.pendingTasks.length > 0) {
       this.closeStdin(groupJid);
     }
@@ -291,6 +334,12 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     if (!state.active || !state.groupFolder || state.isTaskContainer) return false;
     state.idleWaiting = false;
+    // Variant A: a new turn is starting — re-arm the hard timeout so the
+    // runner has a fresh budget for this turn's work. No-op if the budget
+    // wasn't set (timeoutMs===0) or SIGTERM already fired.
+    if (!state.timedOut && state.process && state.runTimeoutMs && state.runTimeoutMs > 0) {
+      this.armRunTimeout(state, state.process, groupJid, state.containerName);
+    }
 
     const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
     try {
