@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Transcribe an audio file using faster-whisper (local, medium model)."""
+"""Transcribe an audio file using faster-whisper (local, large-v3 model)."""
 import sys
 import os
 
 # Override via env for non-standard installs. Defaults match a local
-# faster-whisper-medium install under /opt/whisper-local/.
+# faster-whisper-large-v3 install under /opt/whisper-local/.
 MODEL_BASE = os.environ.get(
     "WHISPER_MODEL_BASE",
-    "/opt/whisper-local/models/models--Systran--faster-whisper-medium/snapshots",
+    "/opt/whisper-local/models/models--Systran--faster-whisper-large-v3/snapshots",
 )
 WHISPER_VENV_SITE = os.environ.get(
     "WHISPER_VENV_SITE",
@@ -19,7 +19,7 @@ def get_model_path():
         snaps = os.listdir(MODEL_BASE)
         if snaps:
             return os.path.join(MODEL_BASE, snaps[0])
-    return "medium"
+    return "large-v3"
 
 def main():
     if len(sys.argv) < 2:
@@ -36,9 +36,15 @@ def main():
     from faster_whisper import WhisperModel
 
     model_path = get_model_path()
-    model = WhisperModel(model_path, device="cpu", compute_type="int8")
+    model = WhisperModel(model_path, device="cpu", compute_type="int8", cpu_threads=8)
 
-    segments, info = model.transcribe(audio_path, beam_size=5, language="ru")
+    segments, info = model.transcribe(
+        audio_path,
+        beam_size=5,
+        language="ru",
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500),
+    )
 
     text = " ".join(seg.text.strip() for seg in segments)
     print(text)
