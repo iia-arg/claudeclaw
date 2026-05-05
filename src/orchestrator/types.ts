@@ -105,10 +105,20 @@ export interface SendOptions {
   replyTo?: { messageId: number };
 }
 
+/**
+ * Result of a successful Channel.sendMessage call.
+ * `messageIds` are platform-assigned identifiers (Telegram message_id as string,
+ * WhatsApp wamid, etc.). May contain multiple ids when the channel chunked the
+ * payload internally. Empty array = channel does not track ids.
+ */
+export interface SendResult {
+  messageIds: string[];
+}
+
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string, opts?: SendOptions): Promise<void>;
+  sendMessage(jid: string, text: string, opts?: SendOptions): Promise<SendResult>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
