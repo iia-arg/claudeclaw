@@ -42,24 +42,31 @@ const server = new McpServer({
 
 server.tool(
   'send_message',
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times.",
+  `Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times.
+
+By default sends to your own current chat. Use target_chat_jid to send to a DIFFERENT chat (A2A — agent-to-agent coordination). Common A2A patterns:
+- Main agent (Забава in DM tg:158901453) delegates to a topic agent: target_chat_jid="tg:-1003941565139:5"
+- Topic agent reports back to main: target_chat_jid="tg:158901453"
+Be conservative: target_chat_jid bypasses your group context, recipient sees the message in their chat. Use only for legitimate inter-agent coordination, never to surprise users in unrelated chats.`,
   {
     text: z.string().describe('The message text to send'),
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
+    target_chat_jid: z.string().optional().describe('JID of a DIFFERENT chat to send to (A2A). If omitted, sends to your own current chat. The chat must be a registered group, otherwise the message is dropped. Use sparingly — this is for agent-to-agent coordination, not for cross-chat broadcasting.'),
+    target_group_folder: z.string().optional().describe('(Optional) group_folder to associate the outgoing message with. Defaults to your own folder. Set this when target_chat_jid points to a group with a different folder (e.g. main agent reaching into a topic).'),
   },
   async (args) => {
     const data: Record<string, string | undefined> = {
       type: 'message',
-      chatJid,
+      chatJid: args.target_chat_jid || chatJid,
       text: args.text,
       sender: args.sender || undefined,
-      groupFolder,
+      groupFolder: args.target_group_folder || groupFolder,
       timestamp: new Date().toISOString(),
     };
 
     writeIpcFile(MESSAGES_DIR, data);
 
-    return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+    return { content: [{ type: 'text' as const, text: args.target_chat_jid ? `Message sent to ${args.target_chat_jid} (A2A).` : 'Message sent.' }] };
   },
 );
 

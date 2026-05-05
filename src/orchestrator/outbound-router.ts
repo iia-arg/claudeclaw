@@ -70,7 +70,9 @@ export function createMessageRouter(channels: Channel[]): MessageRouter {
         return;
       }
 
-      await channel.sendMessage(current.chatJid, formatted);
+      await channel.sendMessage(current.chatJid, formatted, {
+        replyTo: current.replyTo,
+      });
 
       // Fire post-hooks (observe only, errors don't affect delivery)
       for (const hook of postHooks) {
