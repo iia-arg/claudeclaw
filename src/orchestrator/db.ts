@@ -79,11 +79,12 @@ function createSchema(
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
-      folder TEXT NOT NULL UNIQUE,
+      folder TEXT NOT NULL,
       trigger_pattern TEXT NOT NULL,
       added_at TEXT NOT NULL,
       container_config TEXT,
-      requires_trigger INTEGER DEFAULT 1
+      requires_trigger INTEGER DEFAULT 1,
+      session_scope TEXT
     );
 
   `);
@@ -137,6 +138,67 @@ function createSchema(
   try {
     database.exec(`ALTER TABLE registered_groups ADD COLUMN runtime TEXT`);
   } catch { /* column already exists */ }
+
+  // Add session_scope column for per-jid session keying (guest DMs on
+  // claudeclaw-ostrov: each friend gets a separate session_id while sharing
+  // the same folder/disk memory).
+  try {
+    database.exec(`ALTER TABLE registered_groups ADD COLUMN session_scope TEXT`);
+  } catch { /* column already exists */ }
+
+  // Migration: drop UNIQUE constraint on folder so multiple groups (jids) can
+  // share one folder — and therefore one session_id and one memory directory.
+  // SQLite can't drop constraints in-place, so we recreate the table.
+  try {
+    const tableSchema = (database
+      .prepare(
+        `SELECT sql FROM sqlite_master WHERE type='table' AND name='registered_groups'`,
+      )
+      .get() as { sql: string } | undefined)?.sql || '';
+    if (/folder\s+TEXT\s+NOT\s+NULL\s+UNIQUE/i.test(tableSchema)) {
+      // Capture any user-defined triggers on this table so we can recreate them
+      const triggers = database
+        .prepare(
+          `SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='registered_groups' AND sql IS NOT NULL`,
+        )
+        .all() as Array<{ sql: string }>;
+      database.exec(`
+        BEGIN TRANSACTION;
+        CREATE TABLE registered_groups_new (
+          jid TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          folder TEXT NOT NULL,
+          trigger_pattern TEXT NOT NULL,
+          added_at TEXT NOT NULL,
+          container_config TEXT,
+          requires_trigger INTEGER DEFAULT 1,
+          is_main INTEGER DEFAULT 0,
+          agent_config TEXT,
+          runtime TEXT,
+          session_scope TEXT
+        );
+        INSERT INTO registered_groups_new
+          (jid, name, folder, trigger_pattern, added_at, container_config,
+           requires_trigger, is_main, agent_config, runtime, session_scope)
+        SELECT jid, name, folder, trigger_pattern, added_at, container_config,
+               requires_trigger, is_main, agent_config, runtime, session_scope
+          FROM registered_groups;
+        DROP TABLE registered_groups;
+        ALTER TABLE registered_groups_new RENAME TO registered_groups;
+        COMMIT;
+      `);
+      for (const t of triggers) {
+        try {
+          database.exec(t.sql);
+        } catch (err) {
+          logger.warn({ err, sql: t.sql }, 'Failed to recreate trigger after registered_groups migration');
+        }
+      }
+      logger.info('Migrated registered_groups: dropped UNIQUE on folder');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'registered_groups UNIQUE-drop migration failed');
+  }
 
   // Add channel and is_group columns if they don't exist (migration for existing DBs)
   try {
@@ -545,6 +607,15 @@ export function setSession(groupFolder: string, sessionId: string): void {
   ).run(groupFolder, sessionId);
 }
 
+/**
+ * Drop a session row. Used when the SDK reports the session id is invalid
+ * (e.g. "No conversation found with session ID: ..."), so the next run
+ * starts fresh instead of looping on a dead id.
+ */
+export function deleteSession(groupFolder: string): void {
+  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+}
+
 export function getAllSessions(): Record<string, string> {
   const rows = db
     .prepare('SELECT group_folder, session_id FROM sessions')
@@ -575,6 +646,7 @@ export function getRegisteredGroup(
         is_main: number | null;
         agent_config: string | null;
         runtime: string | null;
+        session_scope: string | null;
       }
     | undefined;
   if (!row) return undefined;
@@ -599,6 +671,10 @@ export function getRegisteredGroup(
     isMain: row.is_main === 1 ? true : undefined,
     agentConfig: row.agent_config ? JSON.parse(row.agent_config) : undefined,
     runtime: row.runtime as RegisteredGroup['runtime'] || undefined,
+    sessionScope:
+      row.session_scope === 'jid' || row.session_scope === 'folder'
+        ? row.session_scope
+        : undefined,
   };
 }
 
@@ -607,8 +683,8 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main, agent_config, runtime)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main, agent_config, runtime, session_scope)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -620,6 +696,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.isMain ? 1 : 0,
     group.agentConfig ? JSON.stringify(group.agentConfig) : null,
     group.runtime || null,
+    group.sessionScope || null,
   );
 }
 
@@ -635,6 +712,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     is_main: number | null;
     agent_config: string | null;
     runtime: string | null;
+    session_scope: string | null;
   }>;
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
@@ -658,9 +736,29 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       isMain: row.is_main === 1 ? true : undefined,
       agentConfig: row.agent_config ? JSON.parse(row.agent_config) : undefined,
       runtime: row.runtime as RegisteredGroup['runtime'] || undefined,
+      sessionScope:
+        row.session_scope === 'jid' || row.session_scope === 'folder'
+          ? row.session_scope
+          : undefined,
     };
   }
   return result;
+}
+
+/**
+ * Compute the session storage key for a group + chatJid pair.
+ *
+ * - sessionScope === 'jid' → `${folder}:${chatJid}` (one session per chat)
+ * - otherwise (default 'folder') → `folder` (shared across all jids on this folder)
+ *
+ * The returned string is used as the primary key in the `sessions` table and
+ * as the index into the in-memory `sessions` map in message-loop.ts.
+ */
+export function sessionKeyFor(
+  group: { folder: string; sessionScope?: 'folder' | 'jid' },
+  chatJid: string,
+): string {
+  return group.sessionScope === 'jid' ? `${group.folder}:${chatJid}` : group.folder;
 }
 
 /**

@@ -49,13 +49,15 @@ import {
   getRegisteredGroup,
   getRouterState,
   initDatabase,
+  sessionKeyFor,
   setRegisteredGroup,
   setRouterState,
   setSession,
+  deleteSession,
   storeChatMetadata,
   storeMessage,
 } from './db.js';
-import { GroupQueue } from './group-queue.js';
+import { GroupQueue, resolveRunTimeoutMs } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import {
@@ -96,6 +98,26 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+/**
+ * Detect the SDK's "session does not exist" failure mode. When it fires we
+ * must drop the cached session id, otherwise every retry will spawn a runner
+ * that immediately fails to resume the same dead conversation and we loop
+ * with exponential backoff forever.
+ *
+ * Patterns seen in the wild:
+ *   - "No conversation found with session ID: <uuid>" (Claude Code SDK)
+ *   - "session not found" (generic)
+ */
+function isStaleSessionError(err: unknown): boolean {
+  if (typeof err !== 'string') return false;
+  const lower = err.toLowerCase();
+  return (
+    lower.includes('no conversation found with session id') ||
+    lower.includes('session not found')
+  );
+}
+
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -218,13 +240,6 @@ async function processGroupMessages(chatJid: string, router: MessageRouter): Pro
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
-  saveState();
-
   logger.info(
     { group: group.name, messageCount: missedMessages.length },
     'Processing messages',
@@ -244,37 +259,28 @@ async function processGroupMessages(chatJid: string, router: MessageRouter): Pro
     }, IDLE_TIMEOUT);
   };
 
-  // For trigger-required channels, reply in a thread (using the trigger message ts).
-  // This creates a conversation thread that we register with requiresTrigger: false
-  // so follow-up replies don't need the trigger word.
+  // Find the trigger message — used for visual reply (Telegram reply_parameters
+  // or equivalent). We DO NOT register a per-thread group anymore: thread/JID
+  // expansion caused "fresh agent every reply" amnesia and bloated the DB with
+  // thousands of orphan rows. Visual reply works via opts.replyTo on the
+  // channel instead, with no DB side-effect. Each new turn still requires a
+  // trigger word (or a Telegram reply on the bot's message — caught upstream).
   const triggerMsg = missedMessages.find((m) =>
     TRIGGER_PATTERN.test(m.content.trim()),
   );
-  const isChannelJid = !chatJid.includes(':', chatJid.indexOf(':') + 1);
-  let replyJid = chatJid;
-  let agentGroup = group;
-  if (isChannelJid && triggerMsg && group.requiresTrigger !== false) {
-    const threadJid = `${chatJid}:${triggerMsg.id}`;
-    const threadFolder = `${group.folder}_thread_${triggerMsg.id.replace('.', '_')}`;
-    // Register the thread so follow-up replies route here without trigger
-    if (!registeredGroups[threadJid]) {
-      registerGroup(threadJid, {
-        name: `${group.name} (thread)`,
-        folder: threadFolder,
-        trigger: group.trigger,
-        added_at: new Date().toISOString(),
-        requiresTrigger: false,
-        containerConfig: group.containerConfig,
-      });
-    }
-    replyJid = threadJid;
-    // Use the thread group for the agent so it gets its own container
-    agentGroup = registeredGroups[threadJid] || group;
-  }
+  const replyJid = chatJid;
+  const agentGroup = group;
+  const replyToMessageId =
+    triggerMsg && group.requiresTrigger !== false
+      ? Number(triggerMsg.id)
+      : undefined;
 
   await channel.setTyping?.(replyJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  // Only the FIRST agent output for this turn carries the visual reply pointer;
+  // subsequent stream chunks go as plain follow-ups.
+  let replyConsumed = false;
 
   const agentResult = await runAgent(
     agentGroup,
@@ -293,11 +299,17 @@ async function processGroupMessages(chatJid: string, router: MessageRouter): Pro
         );
         // Route through MessageRouter (handles formatOutbound + hooks + channel delivery)
         if (raw.trim()) {
+          const replyTo =
+            !replyConsumed && replyToMessageId
+              ? { messageId: replyToMessageId }
+              : undefined;
+          if (replyTo) replyConsumed = true;
           await router.route({
             chatJid: replyJid,
             text: raw,
             triggerType: 'agent-response',
             groupFolder: group.folder,
+            replyTo,
           });
           outputSentToUser = true;
         }
@@ -311,6 +323,15 @@ async function processGroupMessages(chatJid: string, router: MessageRouter): Pro
         // would leave the channel group stuck as active forever when
         // a thread JID was created for the reply.
         queue.notifyIdle(chatJid);
+        // notifyIdle's closeStdin path can't reach the thread runner because
+        // registerProcess keys groupFolder by replyJid, while notifyIdle
+        // looks it up under chatJid. Without this, threaded runners hang
+        // until IDLE_TIMEOUT/STALE_ACTIVE_MS reaps them. Force-close the
+        // thread's IPC stdin directly so the SDK stream ends and the
+        // sandbox process exits.
+        if (replyJid !== chatJid) {
+          queue.closeStdinForFolder(agentGroup.folder);
+        }
       }
 
       if (result.status === 'error') {
@@ -322,7 +343,10 @@ async function processGroupMessages(chatJid: string, router: MessageRouter): Pro
   await channel.setTyping?.(replyJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
-  // Log cost tracking data
+  // Log cost tracking data. wasTimeout takes precedence over error: if the
+  // queue forcibly killed the runner via SIGTERM, the underlying SDK call
+  // typically surfaces as `error` too, but the root cause is the timeout.
+  const timedOut = queue.wasTimeout(chatJid);
   logAgentRun({
     groupFolder: agentGroup.folder,
     chatJid: replyJid,
@@ -334,29 +358,32 @@ async function processGroupMessages(chatJid: string, router: MessageRouter): Pro
     durationMs: agentResult.durationMs,
     turns: agentResult.turns || 0,
     model: agentGroup.agentConfig?.model,
-    status: agentResult.status === 'error' || hadError ? 'error' : 'success',
+    status: timedOut
+      ? 'timeout'
+      : agentResult.status === 'error' || hadError
+        ? 'error'
+        : 'success',
   });
 
   if (agentResult.status === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
+      lastAgentTimestamp[chatJid] =
+        missedMessages[missedMessages.length - 1].timestamp;
+      saveState();
       logger.warn(
         { group: group.name },
-        'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+        'Agent error after output was sent, advanced cursor to prevent duplicates',
       );
       return true;
     }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
-    saveState();
-    logger.warn(
-      { group: group.name },
-      'Agent error, rolled back message cursor for retry',
-    );
+    logger.warn({ group: group.name }, 'Agent error, keeping cursor for retry');
     return false;
   }
 
+  lastAgentTimestamp[chatJid] = missedMessages[missedMessages.length - 1].timestamp;
+  saveState();
   return true;
 }
 
@@ -374,7 +401,8 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<RunAgentResult> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  const sessionKey = sessionKeyFor(group, chatJid);
+  const sessionId = sessions[sessionKey];
   const startTime = Date.now();
 
   // Update tasks snapshot for container to read (filtered by group)
@@ -417,8 +445,23 @@ async function runAgent(
         // the runner's catch handler may include the broken id we just tried —
         // re-saving it would loop forever. Only trust ids on success.
         if (output.newSessionId && output.status !== 'error') {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          sessions[sessionKey] = output.newSessionId;
+          setSession(sessionKey, output.newSessionId);
+        }
+        // Auto-recover from a dead session id: if the runner reports
+        // "No conversation found with session ID …", drop the cached id from
+        // both memory and DB so the next attempt starts a fresh conversation
+        // instead of looping on a corpse.
+        if (
+          output.status === 'error' &&
+          isStaleSessionError(output.error)
+        ) {
+          logger.warn(
+            { group: group.name, sessionKey, sessionId },
+            'Stale session detected, clearing cache for fresh restart',
+          );
+          delete sessions[sessionKey];
+          deleteSession(sessionKey);
         }
         if (output.usage) lastUsage = output.usage;
         if (output.turns !== undefined) lastTurns = output.turns;
@@ -437,8 +480,9 @@ async function runAgent(
       assistantName: ASSISTANT_NAME,
       agentConfig: group.agentConfig,
     };
+    const timeoutMs = resolveRunTimeoutMs(runtime, group.agentConfig);
     const onProcessCb = (proc: any, name: string) =>
-      queue.registerProcess(chatJid, proc, name, group.folder);
+      queue.registerProcess(chatJid, proc, name, group.folder, timeoutMs);
 
     const output =
       runtime === 'deepseek'
@@ -458,8 +502,21 @@ async function runAgent(
     // came back with status='error' — it's almost certainly the stale id we
     // just tried to resume and got "No conversation found" on.
     if (output.newSessionId && output.status !== 'error') {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      sessions[sessionKey] = output.newSessionId;
+      setSession(sessionKey, output.newSessionId);
+    }
+
+    // Auto-recover from stale-session errors (mirrors the streaming wrapper).
+    if (
+      output.status === 'error' &&
+      isStaleSessionError(output.error)
+    ) {
+      logger.warn(
+        { group: group.name, sessionKey, sessionId },
+        'Stale session detected, clearing cache for fresh restart',
+      );
+      delete sessions[sessionKey];
+      deleteSession(sessionKey);
     }
 
     // Use usage from the output directly, or from the last streamed output
@@ -656,16 +713,53 @@ export async function main(): Promise<void> {
     );
   }
 
-  // Graceful shutdown handlers
+  // Graceful shutdown handlers — owns ALL signal handling for the service.
+  // Order matters:
+  //   1) flip queue.shuttingDown so no new work enqueues
+  //   2) abort channel long-polls (Telegram getUpdates, Bitrix24, Gmail) so
+  //      no new messages arrive mid-shutdown and active fetches resolve
+  //   3) drain queue.shutdown(): sends _close IPC to active agent runners,
+  //      they finish their grace window and exit, MCP children EOF and die
+  //   4) close credential proxy
+  //   5) exit(0) — service.ts's process.on('exit') hook releases PID-lock
+  //
+  // Grace budget: queue.shutdown(45_000) leaves ~15s for channel disconnect
+  // + proxy close, fitting under TimeoutStopSec=60s in the systemd drop-in.
+  let shuttingDown = false;
   const shutdown = async (signal: string) => {
-    logger.info({ signal }, 'Shutdown signal received');
+    if (shuttingDown) return; // signal can re-fire; ignore
+    shuttingDown = true;
+    logger.info({ signal }, 'Shutdown signal received — draining');
+    // Step 1+2: stop channels FIRST so getUpdates long-polls abort and no
+    // fresh messages enter the queue while we're draining.
+    try {
+      for (const ch of channels) await ch.disconnect();
+    } catch (err) {
+      logger.warn({ err }, 'Channel disconnect raised — continuing shutdown');
+    }
+    // Step 3: drain in-flight agent runs.
+    await queue.shutdown(45000);
+    const remainingActive = queue.getActiveCount();
+    if (remainingActive > 0) {
+      logger.warn(
+        {
+          signal,
+          remainingActive,
+          activeGroups: queue.getActiveGroupsForDebug(),
+        },
+        'message deferred for retry after shutdown grace expired',
+      );
+    }
+    // Step 4: credential proxy (only running in container mode).
     proxyServer?.close();
-    await queue.shutdown();
-    for (const ch of channels) await ch.disconnect();
+    // Step 5: exit cleanly. service.ts's 'exit' hook releases PID-lock.
+    logger.info({ signal }, 'Shutdown drain complete — exiting');
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGHUP', () => shutdown('SIGHUP'));
+  process.on('SIGQUIT', () => shutdown('SIGQUIT'));
 
   // Handle /remote-control and /remote-control-end commands
   async function handleRemoteControl(
@@ -776,8 +870,8 @@ export async function main(): Promise<void> {
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
     queue,
-    onProcess: (groupJid, proc, containerName, groupFolder) =>
-      queue.registerProcess(groupJid, proc, containerName, groupFolder),
+    onProcess: (groupJid, proc, containerName, groupFolder, timeoutMs) =>
+      queue.registerProcess(groupJid, proc, containerName, groupFolder, timeoutMs),
     router,
   });
   const ingestion = createMessageIngestion({
@@ -834,10 +928,21 @@ export async function main(): Promise<void> {
     startWebhookServer(WEBHOOK_PORT, WEBHOOK_SECRET, {
       ingestion,
       findGroupByFolder: (folder) => {
+        // Multiple JIDs may share one folder (e.g. tg-topic + bx24-portal
+        // both registered to `zhizn_yupiter`). Webhook callers specify a
+        // folder, not a channel, so we deterministically prefer the main
+        // group for that folder (or any group flagged isMain) and fall
+        // back to the first match. This avoids "first-Object.entries"
+        // nondeterminism where a webhook started routing to the wrong
+        // channel after a restart simply because the iteration order
+        // changed.
+        let firstMatch: { jid: string; name: string } | undefined;
         for (const [jid, group] of Object.entries(registeredGroups)) {
-          if (group.folder === folder) return { jid, name: group.name };
+          if (group.folder !== folder) continue;
+          if (group.isMain) return { jid, name: group.name };
+          if (!firstMatch) firstMatch = { jid, name: group.name };
         }
-        return undefined;
+        return firstMatch;
       },
     });
   }
@@ -849,4 +954,3 @@ export async function main(): Promise<void> {
     process.exit(1);
   });
 }
-
