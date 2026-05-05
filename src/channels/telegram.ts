@@ -7,6 +7,7 @@ import { promisify } from 'util';
 import { Api, Bot } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../orchestrator/config.js';
+import { markdownToTelegramHtml } from './telegram-html.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -338,9 +339,21 @@ function applyTriggerFromMentionsAndReply(
 }
 
 /**
- * Send a message with Telegram Markdown parse mode, falling back to plain text.
- * Claude's output naturally matches Telegram's Markdown v1 format:
- *   *bold*, _italic_, `code`, ```code blocks```, [links](url)
+ * Send a message via Telegram, converting markdown → HTML first.
+ *
+ * Why HTML and not the bot API's 'Markdown'/'MarkdownV2' modes:
+ *   - 'Markdown' (V1) only supports *single-star* bold, but Claude emits
+ *     **double-star** by CommonMark default → every reply with bold became
+ *     a 400 'can't parse entities' and silently fell back to plain text.
+ *   - 'MarkdownV2' supports CommonMark bold but requires escaping a long
+ *     punctuation set in plain text, which is impossible to get right
+ *     consistently from LLM output.
+ *   - 'HTML' has a small fixed tag whitelist and only `<`, `>`, `&` need
+ *     escaping in regular text — robust and deterministic.
+ *
+ * The plain-text fallback stays as a safety net (defence in depth — if
+ * the converter ever produces a malformed tag, the user still gets
+ * the message body, just unstyled).
  */
 async function sendTelegramMessage(
   api: { sendMessage: Api['sendMessage'] },
@@ -351,20 +364,19 @@ async function sendTelegramMessage(
     reply_parameters?: { message_id: number; allow_sending_without_reply?: boolean };
   } = {},
 ): Promise<number | undefined> {
+  const html = markdownToTelegramHtml(text);
   try {
-    const sent = await api.sendMessage(chatId, text, {
+    const sent = await api.sendMessage(chatId, html, {
       ...options,
-      parse_mode: 'Markdown',
+      parse_mode: 'HTML',
     });
     return sent?.message_id;
   } catch (err) {
-    // Fallback: send as plain text if Markdown parsing fails. Bumped from
-    // logger.debug to logger.warn so silent formatting drops are visible
-    // in production logs — every fallback means the user saw raw `*bold*`
-    // / `_italic_` / `[link](url)` and we want to know it happened.
+    // Last-resort fallback: send the original markdown as plain text. Logs
+    // at warn so we still notice if the converter produces broken HTML.
     logger.warn(
       { err: err instanceof Error ? err.message : String(err) },
-      'Markdown send failed, falling back to plain text',
+      'HTML send failed, falling back to plain text',
     );
     const sent = await api.sendMessage(chatId, text, options);
     return sent?.message_id;
@@ -400,8 +412,8 @@ export class TelegramChannel implements Channel {
           : (ctx.chat as any).title || 'Unknown';
 
       ctx.reply(
-        `Chat ID: \`tg:${chatId}\`\nName: ${chatName}\nType: ${chatType}`,
-        { parse_mode: 'Markdown' },
+        `Chat ID: <code>tg:${chatId}</code>\nName: ${chatName}\nType: ${chatType}`,
+        { parse_mode: 'HTML' },
       );
     });
 
