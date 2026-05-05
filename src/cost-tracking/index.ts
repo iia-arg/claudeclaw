@@ -72,7 +72,7 @@ export interface AgentRunRecord {
   durationMs: number;
   turns: number;
   model?: string;
-  status: 'success' | 'error';
+  status: 'success' | 'error' | 'timeout';
 }
 
 // ---------------------------------------------------------------------------

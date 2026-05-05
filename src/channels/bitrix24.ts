@@ -670,7 +670,7 @@ export class Bitrix24Channel implements Channel {
     }
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(jid: string, text: string, _opts?: { replyTo?: { messageId: number } }): Promise<void> {
     if (!this.ownsJid(jid)) return;
     const dialogId = dialogIdForJid(jid);
     try {

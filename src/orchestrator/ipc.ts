@@ -76,9 +76,14 @@ export function startIpcWatcher(deps: IpcDeps): void {
               if (data.type === 'message' && data.chatJid && data.text) {
                 // Authorization: verify this group can send to this chatJid
                 const targetGroup = registeredGroups[data.chatJid];
+                // A2A back-channel: any agent may send to a main-folder JID
+                // (so topic agents can report back to the main coordinator).
+                const targetIsMain =
+                  targetGroup && folderIsMain.get(targetGroup.folder) === true;
                 if (
                   isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
+                  (targetGroup && targetGroup.folder === sourceGroup) ||
+                  targetIsMain
                 ) {
                   await deps.router.route({
                     chatJid: data.chatJid,

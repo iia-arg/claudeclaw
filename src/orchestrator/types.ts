@@ -42,6 +42,7 @@ export interface AgentConfig {
   costLimitUsd?: number;       // Per-run budget cap
   allowedDomains?: string[];   // Extra network domains the sandbox agent can access (merged with base Anthropic + localhost)
   unsandboxed?: boolean;       // Skip srt sandbox entirely — agent runs as the host user with no network/fs isolation. Use only on trusted internal hosts.
+  runTimeoutMs?: number;       // Hard wall-clock timeout per agent run. SIGTERM at this mark, SIGKILL 30s later. Defaults: 8 min sandbox, 15 min unsandboxed/container/deepseek.
 }
 
 export interface RegisteredGroup {
@@ -54,6 +55,12 @@ export interface RegisteredGroup {
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
   runtime?: 'container' | 'sandbox' | 'deepseek'; // Per-group runtime override (falls back to DEFAULT_RUNTIME)
   agentConfig?: AgentConfig;
+  // Session keying scope. Default 'folder' = all jids sharing this folder share
+  // one session_id (operative memory). 'jid' = each registered jid gets its own
+  // session_id while still sharing the folder's disk memory (CLAUDE.md, files).
+  // Used for guest DMs on @zabava_ostrov_bot so each friend has separate
+  // operative context but the same on-disk knowledge base.
+  sessionScope?: 'folder' | 'jid';
 }
 
 export interface NewMessage {
@@ -93,10 +100,15 @@ export interface TaskRunLog {
 
 // --- Channel abstraction ---
 
+export interface SendOptions {
+  /** Visual reply: when set, the channel replies to the given message id (no thread/DB side-effect). */
+  replyTo?: { messageId: number };
+}
+
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  sendMessage(jid: string, text: string, opts?: SendOptions): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
@@ -125,6 +137,8 @@ export interface OutboundEnvelope {
   triggerType: 'agent-response' | 'ipc' | 'task-result' | 'extension';
   groupFolder?: string;
   meta?: Record<string, unknown>;
+  /** Visual reply target — passed to channel.sendMessage as opts.replyTo. No DB/thread side-effects. */
+  replyTo?: { messageId: number };
 }
 
 export type HookResult<T> =

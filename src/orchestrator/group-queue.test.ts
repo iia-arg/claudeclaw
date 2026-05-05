@@ -481,4 +481,119 @@ describe('GroupQueue', () => {
     resolveProcess!();
     await vi.advanceTimersByTimeAsync(10);
   });
+
+  // --- Hard timeout per run ---
+
+  it('SIGTERMs runner that exceeds timeoutMs and escalates to SIGKILL after grace', async () => {
+    let resolveProcess: () => void;
+    const processMessages = vi.fn(async () => {
+      await new Promise<void>((resolve) => {
+        resolveProcess = resolve;
+      });
+      return true;
+    });
+    queue.setProcessMessagesFn(processMessages);
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Fake child process that never exits on its own.
+    const exitHandlers: Array<() => void> = [];
+    const proc: any = {
+      exitCode: null,
+      signalCode: null,
+      kill: vi.fn(),
+      once: vi.fn((event: string, fn: () => void) => {
+        if (event === 'exit') exitHandlers.push(fn);
+      }),
+    };
+
+    queue.registerProcess('group1@g.us', proc, 'container-1', 'test-group', 5000);
+
+    // Before the timeout fires — runner is still alive, no signal sent.
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(proc.kill).not.toHaveBeenCalled();
+    expect(queue.wasTimeout('group1@g.us')).toBe(false);
+
+    // Cross the timeout boundary — SIGTERM goes out.
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(queue.wasTimeout('group1@g.us')).toBe(true);
+    expect(proc.kill).toHaveBeenCalledTimes(1);
+
+    // Process is still hung after SIGTERM. After 30s grace, escalate to SIGKILL.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(proc.kill).toHaveBeenCalledWith('SIGKILL');
+    expect(proc.kill).toHaveBeenCalledTimes(2);
+
+    // Simulate the process finally exiting — exit handler clears timers and
+    // unblocks the awaiting runner.
+    proc.exitCode = 137;
+    exitHandlers.forEach((fn) => fn());
+    resolveProcess!();
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Slot is freed (active count back to 0).
+    expect(queue.getActiveCount()).toBe(0);
+  });
+
+  it('does NOT fire SIGTERM if process exits before timeoutMs', async () => {
+    let resolveProcess: () => void;
+    const processMessages = vi.fn(async () => {
+      await new Promise<void>((resolve) => {
+        resolveProcess = resolve;
+      });
+      return true;
+    });
+    queue.setProcessMessagesFn(processMessages);
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    const exitHandlers: Array<() => void> = [];
+    const proc: any = {
+      exitCode: null,
+      signalCode: null,
+      kill: vi.fn(),
+      once: vi.fn((event: string, fn: () => void) => {
+        if (event === 'exit') exitHandlers.push(fn);
+      }),
+    };
+    queue.registerProcess('group1@g.us', proc, 'container-1', 'test-group', 60_000);
+
+    // Process exits cleanly before the timeout — exit handler clears timers.
+    await vi.advanceTimersByTimeAsync(5_000);
+    proc.exitCode = 0;
+    exitHandlers.forEach((fn) => fn());
+    resolveProcess!();
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Now even if we let mock time fly, no SIGTERM should have been sent.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(proc.kill).not.toHaveBeenCalled();
+    expect(queue.wasTimeout('group1@g.us')).toBe(false);
+  });
+
+  it('skips timeout machinery when timeoutMs is omitted (back-compat)', async () => {
+    let resolveProcess: () => void;
+    const processMessages = vi.fn(async () => {
+      await new Promise<void>((resolve) => {
+        resolveProcess = resolve;
+      });
+      return true;
+    });
+    queue.setProcessMessagesFn(processMessages);
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    const proc: any = { exitCode: null, signalCode: null, kill: vi.fn(), once: vi.fn() };
+    // No timeoutMs argument — should not arm any timer or attach exit listener.
+    queue.registerProcess('group1@g.us', proc, 'container-1', 'test-group');
+
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000); // 1 hour
+    expect(proc.kill).not.toHaveBeenCalled();
+    expect(proc.once).not.toHaveBeenCalled();
+    expect(queue.wasTimeout('group1@g.us')).toBe(false);
+
+    resolveProcess!();
+    await vi.advanceTimersByTimeAsync(10);
+  });
 });
