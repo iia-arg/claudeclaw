@@ -137,18 +137,6 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   // Create group folder
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
-  // For thread/ticket groups, copy CLAUDE.md from the parent group
-  const parentFolder = group.folder
-    .replace(/_thread_.*$/, '')
-    .replace(/_trigger$/, '');
-  if (parentFolder !== group.folder) {
-    const parentClaudeMd = path.join(GROUPS_DIR, parentFolder, 'CLAUDE.md');
-    const targetClaudeMd = path.join(groupDir, 'CLAUDE.md');
-    if (fs.existsSync(parentClaudeMd) && !fs.existsSync(targetClaudeMd)) {
-      fs.copyFileSync(parentClaudeMd, targetClaudeMd);
-    }
-  }
-
   logger.info(
     { jid, name: group.name, folder: group.folder },
     'Group registered',
