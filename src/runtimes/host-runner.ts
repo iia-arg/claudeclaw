@@ -33,6 +33,11 @@ import { resolveGroupFolderPath, resolveGroupIpcPath } from '../orchestrator/gro
 import { logger } from '../orchestrator/logger.js';
 import { validateAdditionalMounts } from '../orchestrator/mount-security.js';
 import { RegisteredGroup } from '../orchestrator/types.js';
+import {
+  AGENT_RUNNER_SECRET_KEYS,
+  buildAgentRunnerEnv,
+  type HostPath,
+} from './agent-env.js';
 import type { ContainerInput, ContainerOutput } from './container-runner.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
@@ -45,11 +50,6 @@ const HOST_PID_DIR = path.join(DATA_DIR, 'host-pids');
 // Path resolution (mirrors container-runner.ts buildVolumeMounts but only
 // records host→logical-name mapping for env-var injection)
 // ---------------------------------------------------------------------------
-
-interface HostPath {
-  hostPath: string;
-  logicalName: 'project' | 'group' | 'global' | 'ipc' | 'extra';
-}
 
 function buildHostPaths(group: RegisteredGroup, isMain: boolean): HostPath[] {
   const paths: HostPath[] = [];
@@ -217,75 +217,24 @@ export async function runHostAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    // Map logical names to host paths via env vars (the runner falls back
-    // to /workspace/* container paths if these env vars are missing).
-    const pathEnv: Record<string, string> = {};
-    for (const p of hostPaths) {
-      if (p.logicalName === 'group') pathEnv.CLAUDECLAW_GROUP_DIR = p.hostPath;
-      else if (p.logicalName === 'ipc') pathEnv.CLAUDECLAW_IPC_DIR = p.hostPath;
-      else if (p.logicalName === 'project')
-        pathEnv.CLAUDECLAW_PROJECT_DIR = p.hostPath;
-      else if (p.logicalName === 'global')
-        pathEnv.CLAUDECLAW_GLOBAL_DIR = p.hostPath;
-      else if (p.logicalName === 'extra')
-        pathEnv.CLAUDECLAW_EXTRA_DIR = p.hostPath;
-    }
-    // Shared dirs for the extension-tool bridge (request/response IPC).
-    pathEnv.CLAUDECLAW_EXT_TOOL_REQ_DIR = path.join(
-      DATA_DIR,
-      'ipc',
-      '_tool-requests',
-    );
-    pathEnv.CLAUDECLAW_EXT_TOOL_RESP_DIR = path.join(
-      DATA_DIR,
-      'ipc',
-      '_tool-responses',
-    );
-
-    // Per-group Claude SDK config dir — isolates sessions/projects per group.
-    // Mirrors what the deleted sandbox-runner achieved via the
-    // /home/node/.claude bind-mount: the SDK reads/writes session JSONLs
-    // under <CLAUDE_CONFIG_DIR>/projects/<encoded-cwd>/<uuid>.jsonl.
-    // Without this, all groups would share ~/.claude/projects/ and any
-    // sessionId stored in the DB that lives under DATA_DIR/sessions/<folder>/
-    // would fail to resume with "No conversation found with session ID".
-    // Path matches groupSessionsDir constructed in buildHostPaths().
-    pathEnv.CLAUDE_CONFIG_DIR = path.join(
-      DATA_DIR,
-      'sessions',
-      group.folder,
-      '.claude',
-    );
-
-    // Real credentials passed directly (no proxy on host).
-    const secrets = readEnvFile([
-      'ANTHROPIC_API_KEY',
-      'CLAUDE_CODE_OAUTH_TOKEN',
-      'ANTHROPIC_AUTH_TOKEN',
-      'HOMEASSISTANT_LLAT',
-      'HOMEASSISTANT_BASE_URL',
-    ]);
+    // Build the agent runner env via the shared contract helper. This is the
+    // single source of truth for what every Runtime backend must expose to
+    // the spawned `node agent/runner/dist/index.js` process — see
+    // src/runtimes/agent-env.ts for the contract.
+    const secrets = readEnvFile([...AGENT_RUNNER_SECRET_KEYS]);
+    const agentEnv = buildAgentRunnerEnv({
+      groupFolder: group.folder,
+      hostPaths,
+      secrets,
+      dataDir: DATA_DIR,
+      timezone: TIMEZONE,
+    });
 
     const child = spawn('node', [agentRunnerPath], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,
-        TZ: TIMEZONE,
-        ...(secrets.ANTHROPIC_API_KEY
-          ? { ANTHROPIC_API_KEY: secrets.ANTHROPIC_API_KEY }
-          : {
-              CLAUDE_CODE_OAUTH_TOKEN:
-                secrets.CLAUDE_CODE_OAUTH_TOKEN ||
-                secrets.ANTHROPIC_AUTH_TOKEN ||
-                '',
-            }),
-        ...(secrets.HOMEASSISTANT_LLAT
-          ? { HOMEASSISTANT_LLAT: secrets.HOMEASSISTANT_LLAT }
-          : {}),
-        ...(secrets.HOMEASSISTANT_BASE_URL
-          ? { HOMEASSISTANT_BASE_URL: secrets.HOMEASSISTANT_BASE_URL }
-          : {}),
-        ...pathEnv,
+        ...agentEnv,
       },
     });
 
