@@ -244,33 +244,30 @@ async function processGroupMessages(chatJid: string, router: MessageRouter): Pro
     }, IDLE_TIMEOUT);
   };
 
-  // For trigger-required channels, reply in a thread (using the trigger message ts).
-  // This creates a conversation thread that we register with requiresTrigger: false
-  // so follow-up replies don't need the trigger word.
-  const triggerMsg = missedMessages.find((m) =>
-    TRIGGER_PATTERN.test(m.content.trim()),
+  // Find the trigger message — used for visual reply (Telegram reply_parameters
+  // or equivalent). We DO NOT register a per-thread group anymore: thread/JID
+  // expansion caused "fresh agent every reply" amnesia and bloated the DB with
+  // thousands of orphan rows. Visual reply works via opts.replyTo on the
+  // channel instead, with no DB side-effect.
+  //
+  // Two regimes:
+  //   • requiresTrigger=true  — the visual anchor is the message that contains
+  //     the trigger pattern (so the bot's reply visibly answers that explicit
+  //     summons).
+  //   • requiresTrigger=false — every incoming message is implicitly a
+  //     trigger (DM, main group, !жизнь generals). Anchor on the LAST
+  //     non-bot incoming message instead, so multi-message replies in noisy
+  //     chats stay visually linked to what the user just said.
+  const incomingFromUser = missedMessages.filter(
+    (m) => !m.is_from_me && !m.is_bot_message,
   );
-  const isChannelJid = !chatJid.includes(':', chatJid.indexOf(':') + 1);
-  let replyJid = chatJid;
-  let agentGroup = group;
-  if (isChannelJid && triggerMsg && group.requiresTrigger !== false) {
-    const threadJid = `${chatJid}:${triggerMsg.id}`;
-    const threadFolder = `${group.folder}_thread_${triggerMsg.id.replace('.', '_')}`;
-    // Register the thread so follow-up replies route here without trigger
-    if (!registeredGroups[threadJid]) {
-      registerGroup(threadJid, {
-        name: `${group.name} (thread)`,
-        folder: threadFolder,
-        trigger: group.trigger,
-        added_at: new Date().toISOString(),
-        requiresTrigger: false,
-        containerConfig: group.containerConfig,
-      });
-    }
-    replyJid = threadJid;
-    // Use the thread group for the agent so it gets its own container
-    agentGroup = registeredGroups[threadJid] || group;
-  }
+  const triggerMsg =
+    group.requiresTrigger !== false
+      ? missedMessages.find((m) => TRIGGER_PATTERN.test(m.content.trim()))
+      : incomingFromUser[incomingFromUser.length - 1];
+  const replyJid = chatJid;
+  const agentGroup = group;
+  const replyToMessageId = triggerMsg ? Number(triggerMsg.id) : undefined;
 
   await channel.setTyping?.(replyJid, true);
   let hadError = false;

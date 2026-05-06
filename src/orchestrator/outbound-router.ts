@@ -11,6 +11,8 @@ import {
 } from './types.js';
 import { formatOutbound } from './router.js';
 import { logger } from './logger.js';
+import { storeMessageDirect } from './db.js';
+import { ASSISTANT_NAME } from './config.js';
 
 function findChannel(
   channels: Channel[],
@@ -70,9 +72,42 @@ export function createMessageRouter(channels: Channel[]): MessageRouter {
         return;
       }
 
-      await channel.sendMessage(current.chatJid, formatted, {
+      const sendResult = await channel.sendMessage(current.chatJid, formatted, {
         replyTo: current.replyTo,
       });
+
+      // Record outgoing message(s) in DB so delivery is provable. Each
+      // platform-assigned message id becomes a row with is_from_me=1 and
+      // is_bot_message=1. Channels that do not return ids (or fail mid-send)
+      // produce an empty array — we silently skip persistence in that case.
+      const messageIds = sendResult?.messageIds ?? [];
+      if (messageIds.length > 0) {
+        const sentAt = new Date().toISOString();
+        for (const messageId of messageIds) {
+          try {
+            storeMessageDirect({
+              id: messageId,
+              chat_jid: current.chatJid,
+              sender: 'bot',
+              sender_name: ASSISTANT_NAME,
+              content: formatted,
+              timestamp: sentAt,
+              is_from_me: true,
+              is_bot_message: true,
+            });
+          } catch (err) {
+            logger.warn(
+              { jid: current.chatJid, messageId, err },
+              'Failed to persist outgoing message',
+            );
+          }
+        }
+      } else {
+        logger.warn(
+          { jid: current.chatJid, channel: channel.name },
+          'Channel returned no message ids — outgoing not persisted',
+        );
+      }
 
       // Fire post-hooks (observe only, errors don't affect delivery)
       for (const hook of postHooks) {

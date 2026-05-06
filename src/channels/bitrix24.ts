@@ -670,18 +670,21 @@ export class Bitrix24Channel implements Channel {
     }
   }
 
-  async sendMessage(jid: string, text: string, _opts?: { replyTo?: { messageId: number } }): Promise<void> {
-    if (!this.ownsJid(jid)) return;
+  async sendMessage(jid: string, text: string, _opts?: { replyTo?: { messageId: number } }): Promise<{ messageIds: string[] }> {
+    if (!this.ownsJid(jid)) return { messageIds: [] };
     const dialogId = dialogIdForJid(jid);
     try {
       const plain = text.replace(/\*\*(.*?)\*\*/g, '$1').replace(/`([^`]+)`/g, '$1');
-      await this.b24('im.message.add', {
+      const result = await this.b24('im.message.add', {
         DIALOG_ID: dialogId,
         MESSAGE: plain,
       });
       logger.info({ jid, dialogId, length: text.length }, 'Bitrix24 message sent');
+      const msgId = (result as { result?: number | string } | undefined)?.result;
+      return { messageIds: msgId !== undefined ? [String(msgId)] : [] };
     } catch (err) {
       logger.error({ jid, err }, 'Bitrix24: failed to send message');
+      return { messageIds: [] };
     }
   }
 
