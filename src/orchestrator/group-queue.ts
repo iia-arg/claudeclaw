@@ -36,6 +36,43 @@ interface GroupState {
   containerName: string | null;
   groupFolder: string | null;
   retryCount: number;
+  // Hard timeout per run. Set by registerProcess when timeoutMs is provided.
+  // Cleared automatically when the registered process exits, or by runForGroup/
+  // runTask's finally block. `timedOut` survives across the run so message-loop
+  // can pick it up for status='timeout' on the agent_runs row.
+  // runTimeoutMs is the saved budget so we can re-arm the timer when a new
+  // IPC message wakes an idle runner (variant A: cancel-on-idle, arm-on-msg).
+  timeoutTimer: NodeJS.Timeout | null;
+  killTimer: NodeJS.Timeout | null;
+  timedOut: boolean;
+  runTimeoutMs: number | null;
+}
+
+// Grace period between SIGTERM and SIGKILL when timing out a runner.
+const TIMEOUT_KILL_GRACE_MS = 30_000;
+
+/**
+ * Resolve hard timeout per agent run.
+ *  - agentConfig.runTimeoutMs (per-group override) wins if set.
+ *  - sandbox + fully-isolated → 8 min (tighter resource envelope).
+ *  - everything else (container, sandbox-with-unsandboxed, deepseek) → 15 min.
+ *
+ * Lives here so both message-loop and task-scheduler can call it without a
+ * cyclic import (task-scheduler is imported BY message-loop).
+ */
+const DEFAULT_TIMEOUT_SANDBOX_MS = 8 * 60 * 1000;
+const DEFAULT_TIMEOUT_OTHER_MS = 15 * 60 * 1000;
+export function resolveRunTimeoutMs(
+  runtime: string,
+  agentConfig: { runTimeoutMs?: number; unsandboxed?: boolean } | undefined,
+): number {
+  if (typeof agentConfig?.runTimeoutMs === 'number' && agentConfig.runTimeoutMs > 0) {
+    return agentConfig.runTimeoutMs;
+  }
+  if (runtime === 'sandbox' && !agentConfig?.unsandboxed) {
+    return DEFAULT_TIMEOUT_SANDBOX_MS;
+  }
+  return DEFAULT_TIMEOUT_OTHER_MS;
 }
 
 // If a group has been active for longer than this, force-clear it.
@@ -49,6 +86,39 @@ export class GroupQueue {
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
+  private shutdownResolver: (() => void) | null = null;
+
+  getActiveCount(): number {
+    return this.activeCount;
+  }
+
+  getActiveGroupsForDebug(): Array<{
+    groupJid: string;
+    pendingMessages: boolean;
+    pendingTaskCount: number;
+    runningTaskId: string | null;
+    activeSinceMs: number | null;
+  }> {
+    const now = Date.now();
+    const active: Array<{
+      groupJid: string;
+      pendingMessages: boolean;
+      pendingTaskCount: number;
+      runningTaskId: string | null;
+      activeSinceMs: number | null;
+    }> = [];
+    for (const [groupJid, state] of this.groups.entries()) {
+      if (!state.active) continue;
+      active.push({
+        groupJid,
+        pendingMessages: state.pendingMessages,
+        pendingTaskCount: state.pendingTasks.length,
+        runningTaskId: state.runningTaskId,
+        activeSinceMs: state.activeStartedAt ? now - state.activeStartedAt : null,
+      });
+    }
+    return active;
+  }
 
   private getGroup(groupJid: string): GroupState {
     let state = this.groups.get(groupJid);
@@ -65,6 +135,10 @@ export class GroupQueue {
         containerName: null,
         groupFolder: null,
         retryCount: 0,
+        timeoutTimer: null,
+        killTimer: null,
+        timedOut: false,
+        runTimeoutMs: null,
       };
       this.groups.set(groupJid, state);
     }
@@ -76,7 +150,13 @@ export class GroupQueue {
   }
 
   enqueueMessageCheck(groupJid: string): void {
-    if (this.shuttingDown) return;
+    if (this.shuttingDown) {
+      logger.debug(
+        { groupJid },
+        'enqueueMessageCheck during shutdown — message stays in DB, will recover on next start',
+      );
+      return;
+    }
     const state = this.getGroup(groupJid);
 
     if (state.active) {
@@ -139,16 +219,112 @@ export class GroupQueue {
     proc: ChildProcess,
     containerName: string,
     groupFolder?: string,
+    timeoutMs?: number,
   ): void {
     const state = this.getGroup(groupJid);
     state.process = proc;
     state.containerName = containerName;
     if (groupFolder) state.groupFolder = groupFolder;
+
+    // Reset per-run timeout flag; previous run's flag must not bleed in.
+    state.timedOut = false;
+    state.runTimeoutMs = null;
+
+    if (typeof timeoutMs === 'number' && timeoutMs > 0 && typeof proc.kill === 'function') {
+      // Save the budget so notifyIdle/sendMessage can re-arm a fresh timer
+      // when the runner wakes back up after going idle.
+      state.runTimeoutMs = timeoutMs;
+      this.armRunTimeout(state, proc, groupJid, containerName);
+
+      // Clear timers as soon as the process exits — whether normal exit, our
+      // SIGTERM, an unrelated SIGKILL, or anything else. Without this we'd
+      // either fire SIGTERM at an already-dead pid (harmless but noisy) or
+      // leave the kill timer pending and write to a stale state object.
+      if (typeof proc.once === 'function') {
+        proc.once('exit', () => this.clearTimeoutTimers(state));
+      }
+    }
+  }
+
+  /**
+   * Arm the per-run hard timeout: SIGTERM after `timeoutMs`, escalate to
+   * SIGKILL after a grace period if the process is still alive. Idempotent —
+   * if a timer is already armed, it is replaced. Variant A semantics: we
+   * cancel on `notifyIdle` (runner is just waiting for the next message,
+   * shouldn't count against the budget) and re-arm on `sendMessage`
+   * (a new turn just started, the budget applies again).
+   */
+  private armRunTimeout(
+    state: GroupState,
+    proc: ChildProcess,
+    groupJid: string,
+    containerName: string | null,
+  ): void {
+    const timeoutMs = state.runTimeoutMs;
+    if (typeof timeoutMs !== 'number' || timeoutMs <= 0) return;
+
+    if (state.timeoutTimer) {
+      clearTimeout(state.timeoutTimer);
+      state.timeoutTimer = null;
+    }
+
+    state.timeoutTimer = setTimeout(() => {
+      state.timedOut = true;
+      logger.warn(
+        { groupJid, containerName, timeoutMs },
+        'Runner exceeded hard timeout — sending SIGTERM',
+      );
+      try { proc.kill('SIGTERM'); } catch (err) {
+        logger.warn({ groupJid, err }, 'SIGTERM failed');
+      }
+      // Grace period, then escalate to SIGKILL if still alive.
+      state.killTimer = setTimeout(() => {
+        if (proc.exitCode === null && proc.signalCode === null) {
+          logger.warn(
+            { groupJid, containerName, graceMs: TIMEOUT_KILL_GRACE_MS },
+            'Runner did not exit after SIGTERM — escalating to SIGKILL',
+          );
+          try { proc.kill('SIGKILL'); } catch (err) {
+            logger.warn({ groupJid, err }, 'SIGKILL failed');
+          }
+        }
+      }, TIMEOUT_KILL_GRACE_MS);
+    }, timeoutMs);
+  }
+
+  private clearTimeoutTimers(state: GroupState): void {
+    if (state.timeoutTimer) {
+      clearTimeout(state.timeoutTimer);
+      state.timeoutTimer = null;
+    }
+    if (state.killTimer) {
+      clearTimeout(state.killTimer);
+      state.killTimer = null;
+    }
+  }
+
+  /**
+   * Returns true if the most recent run for this group was forcibly killed
+   * by the hard timeout. Read by message-loop to record status='timeout' on
+   * the agent_runs row. Resets when the next registerProcess() is called.
+   */
+  wasTimeout(groupJid: string): boolean {
+    return this.groups.get(groupJid)?.timedOut === true;
   }
 
   notifyIdle(groupJid: string): void {
     const state = this.getGroup(groupJid);
     state.idleWaiting = true;
+    // Variant A: cancel the per-run hard timeout while we're idle.
+    // The runner is just sitting on its open MessageStream waiting for the
+    // next message; it isn't doing any work and shouldn't count against the
+    // 8/15-min budget. We re-arm in sendMessage when a new turn starts.
+    // Don't touch killTimer — if SIGTERM has already fired, the grace
+    // period must run to completion regardless of idle status.
+    if (!state.timedOut && state.timeoutTimer) {
+      clearTimeout(state.timeoutTimer);
+      state.timeoutTimer = null;
+    }
     if (state.pendingTasks.length > 0) {
       this.closeStdin(groupJid);
     }
@@ -158,6 +334,12 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     if (!state.active || !state.groupFolder || state.isTaskContainer) return false;
     state.idleWaiting = false;
+    // Variant A: a new turn is starting — re-arm the hard timeout so the
+    // runner has a fresh budget for this turn's work. No-op if the budget
+    // wasn't set (timeoutMs===0) or SIGTERM already fired.
+    if (!state.timedOut && state.process && state.runTimeoutMs && state.runTimeoutMs > 0) {
+      this.armRunTimeout(state, state.process, groupJid, state.containerName);
+    }
 
     const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
     try {
@@ -177,6 +359,27 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     if (!state.active || !state.groupFolder) return;
     const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+    try {
+      fs.mkdirSync(inputDir, { recursive: true });
+      fs.writeFileSync(path.join(inputDir, '_close'), '');
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Force-close a runner identified by its IPC folder, bypassing GroupState
+   * lookups. Required for the thread-reply case: the queue tracks `active`
+   * by chatJid (parent channel) for activeCount accounting, but
+   * registerProcess() keys groupFolder by replyJid (thread JID). As a result,
+   * `closeStdin(chatJid)` early-returns (no groupFolder on parent state),
+   * and the runner hangs until IDLE_TIMEOUT (30 min) or STALE_ACTIVE_MS
+   * (10 min) reaps it. Calling this with the thread folder writes the
+   * `_close` sentinel directly to the right IPC dir.
+   */
+  closeStdinForFolder(groupFolder: string): void {
+    if (!groupFolder) return;
+    const inputDir = path.join(DATA_DIR, 'ipc', groupFolder, 'input');
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       fs.writeFileSync(path.join(inputDir, '_close'), '');
@@ -210,6 +413,7 @@ export class GroupQueue {
       logger.error({ groupJid, err }, 'Error processing messages');
       this.scheduleRetry(groupJid, state);
     } finally {
+      this.clearTimeoutTimers(state);
       state.active = false;
       state.activeStartedAt = null;
       state.process = null;
@@ -234,6 +438,7 @@ export class GroupQueue {
     } catch (err) {
       logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
     } finally {
+      this.clearTimeoutTimers(state);
       state.active = false;
       state.activeStartedAt = null;
       state.isTaskContainer = false;
@@ -261,7 +466,10 @@ export class GroupQueue {
   }
 
   private drainGroup(groupJid: string): void {
-    if (this.shuttingDown) return;
+    if (this.shuttingDown) {
+      this.maybeResolveShutdown();
+      return;
+    }
     const state = this.getGroup(groupJid);
 
     if (state.pendingTasks.length > 0) {
@@ -302,8 +510,59 @@ export class GroupQueue {
     }
   }
 
-  async shutdown(_gracePeriodMs: number = 10000): Promise<void> {
+  private maybeResolveShutdown(): void {
+    if (!this.shuttingDown || this.shutdownResolver === null) return;
+    if (this.activeCount === 0) {
+      const resolve = this.shutdownResolver;
+      this.shutdownResolver = null;
+      resolve();
+    }
+  }
+
+  async shutdown(gracePeriodMs: number = 120000): Promise<void> {
     this.shuttingDown = true;
     logger.info({ activeCount: this.activeCount }, 'GroupQueue shutting down');
+    if (this.activeCount === 0) return;
+
+    // Signal every active runner to wrap up immediately. Without this the
+    // SDK query loop keeps waiting on stdin until IDLE_TIMEOUT (30 min) —
+    // way past our grace window — and any final assistant message it was
+    // about to emit gets lost when SIGKILL hits at process.exit. Writing
+    // `_close` to each group's IPC input dir makes the runner finish the
+    // current turn, flush its final output via the streaming callback,
+    // and exit cleanly inside the grace period.
+    const signaled: string[] = [];
+    for (const [groupJid, state] of this.groups.entries()) {
+      if (!state.active || !state.groupFolder) continue;
+      try {
+        this.closeStdinForFolder(state.groupFolder);
+        signaled.push(groupJid);
+      } catch (err) {
+        logger.warn(
+          { groupJid, folder: state.groupFolder, err },
+          'Failed to signal close on shutdown',
+        );
+      }
+    }
+    if (signaled.length > 0) {
+      logger.info(
+        { count: signaled.length },
+        'Sent _close signal to active runners',
+      );
+    }
+
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        this.shutdownResolver = resolve;
+      }),
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, gracePeriodMs);
+      }),
+    ]);
+
+    logger.info(
+      { activeCount: this.activeCount, gracePeriodMs },
+      'GroupQueue shutdown wait complete',
+    );
   }
 }

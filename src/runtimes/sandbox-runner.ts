@@ -381,22 +381,44 @@ export async function runSandboxAgent(
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const processName = `claudeclaw-sandbox-${safeName}-${Date.now()}`;
 
-  // Build mounts and srt settings
+  // Mounts are built either way — they set up per-group session/skills/ipc
+  // dirs that the agent runner needs regardless of sandboxing. Only the
+  // srt-specific bits (settings JSON, agent-scoped /tmp scratch dir,
+  // GTK/dconf cache write-allows) are skipped when running unsandboxed.
   const mounts = buildSandboxMounts(group, input.isMain);
-  const settingsDir = path.join(DATA_DIR, 'sandbox-settings');
-  fs.mkdirSync(settingsDir, { recursive: true });
-  const settingsPath = path.join(settingsDir, `${processName}.json`);
-  // Merge domains: extension manifests + per-group agentConfig
-  const extensionDomains = getExtensionAllowedDomains();
-  const groupDomains = group.agentConfig?.allowedDomains ?? [];
-  const extraDomains = [...extensionDomains, ...groupDomains];
-  const settings = buildSandboxSettings(mounts, extraDomains);
-  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
 
   const unsandboxed = group.agentConfig?.unsandboxed === true;
+
+  // Sandbox-only state. When unsandboxed, this stays null and the cleanup
+  // paths skip it safely.
+  //
+  // NOTE 2026-05-05: srt sandbox is currently unused on this server — all
+  // 22 Claude agents run unsandboxed (decision 2026-05-04, see
+  // CLAUDE.md "Архитектура изоляции"). The sandbox path is kept dormant in
+  // case Anthropic restores AF_UNIX socket support in srt and we want to
+  // bring it back. The previously-added LibreOffice / GTK / dconf workarounds
+  // (extra allowWrite for /tmp, /var/tmp, ~/.cache, ~/.config and per-spawn
+  // TMPDIR redirects) were removed 2026-05-05 — if sandbox returns and we
+  // need office toolkit inside it, that work has to be redone consciously.
+  let settingsPath: string | null = null;
+
+  if (!unsandboxed) {
+    const settingsDir = path.join(DATA_DIR, 'sandbox-settings');
+    fs.mkdirSync(settingsDir, { recursive: true });
+    settingsPath = path.join(settingsDir, `${processName}.json`);
+
+    // Merge domains: extension manifests + per-group agentConfig
+    const extensionDomains = getExtensionAllowedDomains();
+    const groupDomains = group.agentConfig?.allowedDomains ?? [];
+    const extraDomains = [...extensionDomains, ...groupDomains];
+    const settings = buildSandboxSettings(mounts, extraDomains);
+
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  }
+
   const sandboxArgs = unsandboxed
     ? ['node', path.join(CODE_ROOT, 'agent', 'runner', 'dist', 'index.js')]
-    : buildSandboxArgs(settingsPath);
+    : buildSandboxArgs(settingsPath!);
   if (unsandboxed) {
     logger.warn(
       { group: group.name },
@@ -431,6 +453,15 @@ export async function runSandboxAgent(
         pathEnv.CLAUDECLAW_GLOBAL_DIR = mount.hostPath;
       else if (mount.containerPath?.startsWith('/workspace/extra'))
         pathEnv.CLAUDECLAW_EXTRA_DIR = mount.hostPath;
+      // Claude Code SDK looks for its config root under HOME/.claude (== ~/.claude).
+      // In sandbox mode HOME stays as the host's HOME (/home/claude), which is
+      // mounted ro. SDK's Bash tool then tries mkdir ~/.claude/session-env/<uuid>
+      // and fails with ENOENT/EROFS — every Bash call dies before running anything.
+      // Override CLAUDE_CONFIG_DIR to point at the already-RW group sessions dir
+      // (the one bound for container mode at /home/node/.claude). SDK respects
+      // this env var as the override for ~/.claude.
+      else if (mount.containerPath === '/home/node/.claude')
+        pathEnv.CLAUDE_CONFIG_DIR = mount.hostPath;
     }
     // Shared dirs for the extension-tool bridge (request/response IPC).
     // Sandbox runs on host, so we point directly to the orchestrator's DATA_DIR.
@@ -595,18 +626,19 @@ export async function runSandboxAgent(
 
     child.on('close', (code) => {
       clearTimeout(timeout);
-      // Clean up PID and settings files
+      // Clean up PID and (sandbox-only) settings/tmp files
       try {
         fs.unlinkSync(pidFile);
       } catch {
         /* ignore */
       }
-      try {
-        fs.unlinkSync(settingsPath);
-      } catch {
-        /* ignore */
+      if (settingsPath) {
+        try {
+          fs.unlinkSync(settingsPath);
+        } catch {
+          /* ignore */
+        }
       }
-
       const duration = Date.now() - startTime;
 
       if (timedOut) {
@@ -688,10 +720,12 @@ export async function runSandboxAgent(
       } catch {
         /* ignore */
       }
-      try {
-        fs.unlinkSync(settingsPath);
-      } catch {
-        /* ignore */
+      if (settingsPath) {
+        try {
+          fs.unlinkSync(settingsPath);
+        } catch {
+          /* ignore */
+        }
       }
       resolve({
         status: 'error',
