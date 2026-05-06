@@ -65,7 +65,7 @@ src/
   runtimes/                   # Agent execution backends
     container-runtime.ts      # Container runtime abstraction (binary detection, lifecycle)
     container-runner.ts       # Container-based agent runner (Docker/Apple Container)
-    sandbox-runner.ts         # Sandbox-based agent runner (srt, OS-level sandboxing)
+    host-runner.ts            # Host-based agent runner (direct node spawn, no sandboxing)
   channels/                   # Built-in channels (whatsapp, telegram)
   cost-tracking/              # Built-in: token usage + cost estimation
   webhook/                    # Built-in: HTTP webhook triggers
@@ -114,21 +114,23 @@ Extensions are installable packages in `extensions/claudeclaw-*/`. Each has a `m
 
 Set `RUNTIME` in `.env`:
 - `container` (default) — runs agents in Apple Container / Docker
-- `sandbox` — uses `@anthropic-ai/sandbox-runtime` (OS-level sandboxing, <10ms cold start)
+- `host` — runs agents directly on the host (no sandboxing, fastest startup)
 
-Per-group override: set `"runtime": "sandbox"` in the registered group config.
+Per-group override: set `"runtime": "host"` in the registered group config.
 
-### Sandbox Runtime Details
+### Host Runtime Details
 
-**Auth:** Sandbox passes real credentials directly (not through credential proxy). Network isolation via `allowedDomains` restricts outbound traffic to `api.anthropic.com` and `localhost` only, preventing credential exfiltration.
+**No sandbox.** The previous `sandbox` runtime (using `@anthropic-ai/sandbox-runtime` / srt) was removed in 2026-05 — it hardcoded a BPF blocklist on `socket(AF_UNIX,...)` which broke LibreOffice/dconf/D-Bus and the office toolkit. Isolation is now via behavioural rules in per-group system prompts (see `shared/agent-safety-preamble.md`).
 
-**Path mapping:** Container mode maps `/workspace/*` via volume mounts. Sandbox runs on the host, so the agent runner uses `CLAUDECLAW_*_DIR` env vars (`CLAUDECLAW_GROUP_DIR`, `CLAUDECLAW_IPC_DIR`, `CLAUDECLAW_PROJECT_DIR`, `CLAUDECLAW_GLOBAL_DIR`, `CLAUDECLAW_EXTRA_DIR`) to resolve actual host paths.
+**Auth:** Host runner passes real credentials directly via env vars to the spawned `node agent/runner/dist/index.js` process. No proxy.
 
-**Agent runner compilation:** Sandbox can't use `tsx` (blocked Unix sockets). Pre-compile with `cd agent/runner && npx tsc`. The compiled output at `agent/runner/dist/index.js` is used by sandbox; container mode uses its own copy baked into the image.
+**Path mapping:** Container mode maps `/workspace/*` via volume mounts. Host mode runs in-place, so the agent runner uses `CLAUDECLAW_*_DIR` env vars (`CLAUDECLAW_GROUP_DIR`, `CLAUDECLAW_IPC_DIR`, `CLAUDECLAW_PROJECT_DIR`, `CLAUDECLAW_GLOBAL_DIR`, `CLAUDECLAW_EXTRA_DIR`) to resolve actual host paths.
 
-**srt settings schema:** The `--settings <path>` JSON file requires ALL fields including `allowRead: []` even if empty. Omitting causes silent schema validation failure. Key fields: `network.allowedDomains`, `network.deniedDomains`, `network.allowLocalBinding`, `filesystem.denyRead`, `filesystem.allowRead`, `filesystem.allowWrite`, `filesystem.denyWrite`.
+**Per-group session isolation:** Host runner sets `CLAUDE_CONFIG_DIR=<DATA_DIR>/sessions/<folder>/.claude/` per spawn. The Claude Code SDK reads/writes session JSONLs at `<CLAUDE_CONFIG_DIR>/projects/<encoded-cwd>/<uuid>.jsonl`. Container mode achieves the same via a bind-mount `<groupSessionsDir> → /home/node/.claude` — the SDK inside the container sees the per-folder dir as its `~/.claude`.
 
-**Config reading:** ClaudeClaw does NOT use `dotenv`. The `RUNTIME` value in `.env` is read via `readEnvFile()` in `config.ts`.
+**Agent runner compilation:** Pre-compile with `cd agent/runner && npx tsc`. The compiled output at `agent/runner/dist/index.js` is used by both host and container modes (container bakes its own copy into the image).
+
+**Config reading:** ClaudeClaw does NOT use `dotenv`. The `RUNTIME` value in `.env` is read via `readEnvFile()` in `config.ts`. Anything other than `host` or `deepseek` falls back to `container`.
 
 ## Memory System
 
@@ -163,36 +165,17 @@ agentConfig: {
   maxTurns: 10,             // Limit conversation turns
   costLimitUsd: 0.50,       // Per-run budget cap
   effort: 'high',           // Model reasoning effort
-  allowedDomains: [          // Extra network domains for sandbox
-    'api.github.com',        // GitHub API (for gh CLI)
-    '*.github.com',          // GitHub web
-    'my-db.railway.app',     // Database host
-  ],
+  runtime: 'host',          // 'container' | 'host' | 'deepseek' (overrides .env RUNTIME)
 }
 ```
 
 Stored as JSON in `registered_groups.agent_config` column. Passed through `ContainerInput` to the agent runner, which applies overrides to the SDK `query()` call.
 
-### Network Access (Sandbox Mode)
+### Network Access
 
-The sandbox restricts outbound network by default. Agents can only connect to domains listed in `allowedDomains`. The final domain list is built from three sources:
+There is no built-in egress filtering anymore. Host runtime → agent has the host's full network. Container runtime → agent has whatever the Docker/Apple Container network policy provides (default: open). The `allowedDomains` field on `agentConfig` and the `provides.allowedDomains` on extension manifests were removed in 2026-05 together with the sandbox runtime.
 
-1. **Base (always):** `api.anthropic.com`, `*.anthropic.com`, `localhost`, `127.0.0.1`
-2. **Extension manifests:** each extension declares domains it needs in `manifest.json` → `provides.allowedDomains`
-3. **Per-group `agentConfig.allowedDomains`:** custom domains for this group's specific needs
-
-Common domains to add:
-- `api.github.com`, `*.github.com` — for `gh` CLI and GitHub API
-- `*.railway.app` — for Railway-hosted databases
-- `*.amazonaws.com` — for AWS services
-- `api.openai.com` — for OpenAI API access (multi-model routing)
-
-To update a group's allowed domains:
-```sql
-UPDATE registered_groups
-SET agent_config = json_set(COALESCE(agent_config, '{}'), '$.allowedDomains', json('["api.github.com","*.github.com"]'))
-WHERE folder = 'mygroup';
-```
+If you need per-group egress restrictions, do it at infrastructure level (firewall rules, container network policy, or HTTP proxy with allowlist) — not in ClaudeClaw config.
 
 ## Webhook Triggers
 
@@ -259,8 +242,8 @@ This rule exists because credentials were previously committed to a public repo.
 
 ## Troubleshooting
 
-**Stale sessions after switching runtimes:** When switching between container and sandbox (or vice versa), existing session IDs may cause "No conversation found" errors. Clear with: `sqlite3 store/messages.db "DELETE FROM sessions"`
+**Stale sessions after switching runtimes:** When switching between `container` and `host` (or after architectural changes), existing session IDs may cause "No conversation found" errors. Clear with: `sqlite3 store/messages.db "DELETE FROM sessions"`
 
-**Sandbox agent EPERM on network:** The srt settings `allowRead: []` field MUST be present (even empty). Without it, the entire settings file silently fails validation and network is fully blocked. Also verify `allowedDomains` includes `api.anthropic.com`.
+**Host agent fails to resume sessions:** Verify `CLAUDE_CONFIG_DIR` is being set in `src/runtimes/host-runner.ts` to `<DATA_DIR>/sessions/<folder>/.claude/`. Without it, the SDK falls back to `~/.claude/projects/` and stored DB session IDs become unreachable.
 
-**Sandbox agent can't find paths:** Check that `CLAUDECLAW_*_DIR` env vars are being set in `sandbox-runner.ts` `runSandboxAgent()`. The agent runner falls back to `/workspace/*` (container paths) if env vars are missing.
+**Host agent can't find paths:** Check that `CLAUDECLAW_*_DIR` env vars are being set in `host-runner.ts`. The agent runner falls back to `/workspace/*` (container paths) if env vars are missing.
