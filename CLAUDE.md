@@ -242,7 +242,22 @@ This rule exists because credentials were previously committed to a public repo.
 
 ## Troubleshooting
 
-**Stale sessions after switching runtimes:** When switching between `container` and `host` (or after architectural changes), existing session IDs may cause "No conversation found" errors. Clear with: `sqlite3 store/messages.db "DELETE FROM sessions"`
+**Stale sessions after switching runtimes:** When switching between `container` and `host` (or after architectural changes), existing session IDs may cause "No conversation found" errors. Clear sessions:
+
+```bash
+sqlite3 store/messages.db "DELETE FROM sessions"
+```
+
+**Stale `runtime` field in `agent_config`:** Per-group `agent_config.runtime` overrides `.env RUNTIME`. After removing a runtime (e.g., the `sandbox` removal in 2026-05-06), rows that still have `"runtime": "sandbox"` in their JSON config will fall through to the default container runtime — usually NOT what you want post-migration. Audit and strip with:
+
+```bash
+# audit
+sqlite3 store/messages.db "SELECT folder, jid, agent_config FROM registered_groups WHERE agent_config LIKE '%runtime%'"
+# strip the field across all rows
+sqlite3 store/messages.db "UPDATE registered_groups SET agent_config = json_remove(agent_config, '\$.runtime') WHERE agent_config LIKE '%runtime%'"
+```
+
+Then restart the service so the in-memory group cache reloads.
 
 **Host agent fails to resume sessions:** Verify `CLAUDE_CONFIG_DIR` is being set in `src/runtimes/host-runner.ts` to `<DATA_DIR>/sessions/<folder>/.claude/`. Without it, the SDK falls back to `~/.claude/projects/` and stored DB session IDs become unreachable.
 
