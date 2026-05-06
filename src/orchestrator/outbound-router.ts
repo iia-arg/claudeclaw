@@ -24,6 +24,9 @@ function findChannel(
 export function createMessageRouter(channels: Channel[]): MessageRouter {
   const preHooks: OutboundPreHook[] = [];
   const postHooks: ((envelope: OutboundEnvelope) => void)[] = [];
+  let a2aFallback:
+    | ((envelope: OutboundEnvelope) => Promise<boolean>)
+    | null = null;
 
   return {
     addPreHook(hook: OutboundPreHook): void {
@@ -32,6 +35,12 @@ export function createMessageRouter(channels: Channel[]): MessageRouter {
 
     addPostHook(hook: (envelope: OutboundEnvelope) => void): void {
       postHooks.push(hook);
+    },
+
+    setA2aFallback(
+      fallback: (envelope: OutboundEnvelope) => Promise<boolean>,
+    ): void {
+      a2aFallback = fallback;
     },
 
     async route(envelope: OutboundEnvelope): Promise<void> {
@@ -60,6 +69,34 @@ export function createMessageRouter(channels: Channel[]): MessageRouter {
       const formatted = formatOutbound(current.text);
       if (!formatted) return;
 
+      // A2A inter-instance bus: try first, before local channel lookup. If
+      // the target JID belongs to a sibling instance the bus drops a JSON
+      // payload into their inbox and we treat the message as delivered.
+      if (a2aFallback) {
+        try {
+          const formattedEnvelope: OutboundEnvelope = {
+            ...current,
+            text: formatted,
+          };
+          const handled = await a2aFallback(formattedEnvelope);
+          if (handled) {
+            for (const hook of postHooks) {
+              try {
+                hook(formattedEnvelope);
+              } catch (err) {
+                logger.error({ err }, 'Outbound post-hook error (a2a path)');
+              }
+            }
+            return;
+          }
+        } catch (err) {
+          logger.error(
+            { err, jid: current.chatJid },
+            'A2A fallback errored, falling through to local channel',
+          );
+        }
+      }
+
       // Find channel and deliver
       const channel = channels.find(
         (c) => c.ownsJid(current.chatJid) && c.isConnected(),
@@ -83,17 +120,29 @@ export function createMessageRouter(channels: Channel[]): MessageRouter {
       const messageIds = sendResult?.messageIds ?? [];
       if (messageIds.length > 0) {
         const sentAt = new Date().toISOString();
+        // For cross-group A2A delivery (one local group sending to another
+        // local group via send_message(target_chat_jid=…)), persist with
+        // is_bot_message=0 so the receiving group's message-loop sees the
+        // row and triggers its agent. Telegram bot polling does NOT echo
+        // our own outbound back as updates, so without this row the
+        // recipient's loop has nothing to consume. For all other cases
+        // (own stream output, task-results, extensions) keep the default
+        // anti-loop bot mark.
+        const persistAsBotMessage = !current.crossGroup;
+        const persistSender = current.crossGroup
+          ? `a2a:${ASSISTANT_NAME}`
+          : 'bot';
         for (const messageId of messageIds) {
           try {
             storeMessageDirect({
               id: messageId,
               chat_jid: current.chatJid,
-              sender: 'bot',
+              sender: persistSender,
               sender_name: ASSISTANT_NAME,
               content: formatted,
               timestamp: sentAt,
               is_from_me: true,
-              is_bot_message: true,
+              is_bot_message: persistAsBotMessage,
             });
           } catch (err) {
             logger.warn(

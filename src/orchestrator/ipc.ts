@@ -22,6 +22,14 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  /**
+   * Optional probe: returns true if the JID belongs to a sibling instance
+   * exposed via the A2A bus. Used to authorize cross-instance message
+   * delivery from non-main agents — sending to a remote JID is a separate
+   * trust class (the receiving instance also validates) so the local
+   * "main-only or same-folder" gate does not apply.
+   */
+  isRemoteA2a?: (jid: string) => boolean;
 }
 
 let ipcWatcherRunning = false;
@@ -80,16 +88,35 @@ export function startIpcWatcher(deps: IpcDeps): void {
                 // (so topic agents can report back to the main coordinator).
                 const targetIsMain =
                   targetGroup && folderIsMain.get(targetGroup.folder) === true;
+                // Inter-instance A2A: target is a JID owned by a SIBLING
+                // instance (registered in shared/instance-registry/). Allow
+                // any local agent to send — the receiving instance does its
+                // own authorization (registry membership, ingestion checks).
+                const targetIsRemoteA2a =
+                  !targetGroup &&
+                  typeof deps.isRemoteA2a === 'function' &&
+                  deps.isRemoteA2a(data.chatJid);
                 if (
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup) ||
-                  targetIsMain
+                  targetIsMain ||
+                  targetIsRemoteA2a
                 ) {
+                  // crossGroup: explicit A2A delivery to a DIFFERENT local
+                  // group. Tells the persist step in outbound-router to use
+                  // is_bot_message=0 so the recipient's message-loop sees it.
+                  // Same-group sends (agent talking to its own chat) and
+                  // cross-instance sends (a2aFallback handles persist on the
+                  // receiving side) keep the default anti-loop persist.
+                  const crossGroup = !!(
+                    targetGroup && targetGroup.folder !== sourceGroup
+                  );
                   await deps.router.route({
                     chatJid: data.chatJid,
                     text: data.text,
                     triggerType: 'ipc',
                     groupFolder: sourceGroup,
+                    crossGroup,
                   });
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },

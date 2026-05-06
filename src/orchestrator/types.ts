@@ -158,6 +158,19 @@ export interface OutboundEnvelope {
   meta?: Record<string, unknown>;
   /** Visual reply target — passed to channel.sendMessage as opts.replyTo. No DB/thread side-effects. */
   replyTo?: { messageId: number };
+  /**
+   * True when this is explicit A2A delivery to a DIFFERENT group on the SAME
+   * instance (e.g. agent A in folder X calls send_message(target_chat_jid=Y)
+   * where Y belongs to folder Z, registered locally). Tells the persist step
+   * to mark the row with is_bot_message=0 so the receiving group's
+   * message-loop picks it up and triggers its agent. Without this flag,
+   * same-instance A2A is silently swallowed by the anti-loop SQL filter in
+   * getNewMessages (`AND is_bot_message = 0`). Stays undefined/false for the
+   * agent's own stream output, task-results, extension messages, and
+   * cross-instance A2A (the inter-instance bus handles delivery via inbox
+   * before persist runs).
+   */
+  crossGroup?: boolean;
 }
 
 export type HookResult<T> =
@@ -185,6 +198,16 @@ export interface MessageRouter {
   route(envelope: OutboundEnvelope): Promise<void>;
   /** Convenience: route with minimal envelope */
   send(jid: string, text: string): Promise<void>;
+  /**
+   * Optional A2A fallback: invoked AFTER pre-hooks and formatting, BEFORE the
+   * local channel lookup. If the function returns true, the message is
+   * considered delivered (post-hooks fire, no channel send). If false, the
+   * normal local-channel path runs. Used by the inter-instance A2A bus to
+   * route messages to JIDs that belong to a sibling instance.
+   */
+  setA2aFallback?(
+    fallback: (envelope: OutboundEnvelope) => Promise<boolean>,
+  ): void;
 }
 
 // Callback type that channels use to deliver inbound messages

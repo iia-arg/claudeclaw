@@ -60,6 +60,7 @@ import {
 import { GroupQueue, resolveRunTimeoutMs } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
+import { startA2aBus } from './a2a-bus.js';
 import {
   startExtensionToolBridge,
   writeExtensionToolsManifest,
@@ -933,6 +934,26 @@ export async function main(): Promise<void> {
   // Wire extension hooks into services
   wireExtensionHooks(ingestion, router);
 
+  // A2A inter-instance bus: shared-FS push transport between sibling
+  // instances. Reads/writes registry under shared/instance-registry/, watches
+  // shared/a2a-inbox/<this-instance>/ for incoming payloads, and provides
+  // the outbound fallback that lets `send_message(target_chat_jid=X)` reach
+  // a JID owned by another instance without going through the local bot.
+  const a2aInstance = path.basename(process.cwd());
+  const a2aBus = startA2aBus({
+    instance: a2aInstance,
+    registeredGroups: () => registeredGroups,
+    ingestion,
+    logger,
+  });
+  if (router.setA2aFallback) {
+    router.setA2aFallback((envelope) => a2aBus.outboundFallback(envelope));
+  }
+  // Note: when a new group is registered at runtime via IPC, it will be
+  // exposed to sibling instances at the next periodic refresh (~30s).
+  // Acceptable latency for v1; can be tightened later by piping a refresh
+  // hook through registerGroup if needed.
+
   // Start all plugins (triage, etc.)
   callExtensionStartup({
     ingestion,
@@ -957,6 +978,11 @@ export async function main(): Promise<void> {
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
+    // Cross-instance A2A authorization probe: when a non-main agent calls
+    // send_message(target_chat_jid=X) and X is owned by a sibling instance
+    // (visible via shared registry), allow the message — the remote inbox
+    // and ingestion are the authorization boundary.
+    isRemoteA2a: (jid: string) => a2aBus.isRemote(jid),
   });
 
   // Bridge for extension-declared MCP tools: agent-runner sees them via
