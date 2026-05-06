@@ -76,6 +76,12 @@ export class Bitrix24Channel implements Channel {
   private pollCount = 0;
   // Inflight refresh promise — coalesce concurrent 401s so only one refresh fires.
   private refreshInflight: Promise<boolean> | null = null;
+  // True between connect() and disconnect(); independent of pollTimer state
+  // so isConnected() stays accurate after pauseInbound() clears the timer.
+  private connected: boolean = false;
+  // True after pauseInbound(); poll() short-circuits so even an inflight tick
+  // started just before clearInterval cannot leak new onMessage callbacks.
+  private inboundPaused: boolean = false;
 
   constructor(
     auth: BxAuth,
@@ -249,6 +255,8 @@ export class Bitrix24Channel implements Channel {
       { allowedUserId: this.allowedUserId, extraUsers: [...this.extraAllowedUserIds], groups: [...this.knownGroupChatIds] },
       'Bitrix24 channel connected, starting poll',
     );
+    this.connected = true;
+    this.inboundPaused = false;
     this.pollTimer = setInterval(() => this.poll(), POLL_INTERVAL_MS);
   }
 
@@ -649,23 +657,29 @@ export class Bitrix24Channel implements Channel {
   }
 
   private async poll(): Promise<void> {
+    // Short-circuit if inbound was paused mid-tick (e.g. SIGTERM during poll).
+    if (this.inboundPaused) return;
     this.pollCount++;
 
     // Periodically discover new groups
     if (this.pollCount % GROUP_DISCOVER_EVERY === 0) {
       await this.discoverGroupChats(true);
     }
+    if (this.inboundPaused) return;
 
     // Poll personal dialog (Alexander)
     await this.pollDialog(this.allowedUserId, jidForUser(this.allowedUserId), false);
+    if (this.inboundPaused) return;
 
     // Poll extra authorized users' personal dialogs
     for (const userId of this.extraAllowedUserIds) {
+      if (this.inboundPaused) return;
       await this.pollDialog(userId, jidForUser(userId), false);
     }
 
     // Poll all known group chats
     for (const chatId of this.knownGroupChatIds) {
+      if (this.inboundPaused) return;
       await this.pollDialog(`chat${chatId}`, jidForChat(chatId), true);
     }
   }
@@ -689,18 +703,33 @@ export class Bitrix24Channel implements Channel {
   }
 
   isConnected(): boolean {
-    return this.pollTimer !== null;
+    // True between connect() and disconnect(), regardless of pauseInbound state.
+    // Outbound (sendMessage) keeps working after pauseInbound() until disconnect().
+    return this.connected;
   }
 
   ownsJid(jid: string): boolean {
     return jid.startsWith('bx24:');
   }
 
-  async disconnect(): Promise<void> {
+  async pauseInbound(): Promise<void> {
+    if (this.inboundPaused) return;
+    this.inboundPaused = true;
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    logger.info('Bitrix24 inbound paused (sendMessage still works)');
+  }
+
+  async disconnect(): Promise<void> {
+    // Idempotent: pauseInbound() may have already cleared the timer.
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.inboundPaused = true;
+    this.connected = false;
     logger.info('Bitrix24 channel disconnected');
   }
 
