@@ -170,7 +170,7 @@ interface DmWhitelistUser {
 }
 
 interface DmWhitelistTemplate {
-  runtime?: 'sandbox' | 'container' | 'deepseek';
+  runtime?: 'container' | 'host' | 'deepseek';
   session_scope?: 'folder' | 'jid';
   agentConfig?: Record<string, unknown>;
 }
@@ -923,20 +923,19 @@ registerChannel('telegram', (opts: ChannelOpts) => {
 
   const autoRegisterPrivateChat = autoRegisterEnabled && opts.registerGroup
     ? (jid: string, name: string, userId: number | undefined) => {
-        // When whitelist is configured we expect a guest_agent_config_template
-        // to apply tight sandbox + character system prompt. Without the
-        // template we refuse to register (fail-closed) — falling back to
-        // unsandboxed:true on a guest-facing instance would be a security hole.
-        let agentConfig: Record<string, unknown> = { unsandboxed: true };
-        let runtime: 'container' | 'sandbox' | 'deepseek' | undefined;
+        // When a whitelist is configured we expect a guest_agent_config_template
+        // to apply a character system prompt + tight tool allowlist for guest
+        // bots like @zabava_ostrov_bot. Without the template we keep an empty
+        // agentConfig — the whitelist alone is the access gate (used by trusted-
+        // only bots like мамин where every user is family).
+        //
+        // Sandbox runtime no longer exists (removed 2026-05-06). All groups now
+        // run runtime=host by default; isolation is behavioural via systemPrompt
+        // (preamble) + tool restrictions, not OS-level sandbox.
+        let agentConfig: Record<string, unknown> = {};
+        let runtime: 'container' | 'host' | 'deepseek' | undefined;
         let sessionScope: 'folder' | 'jid' | undefined;
 
-        // If a whitelist is configured AND it carries a guest_agent_config_template,
-        // we apply that template (sandbox/tight tools/character prompt — for guest
-        // bots like @zabava_ostrov_bot). If the whitelist file has no template
-        // (e.g. trusted-only bots like мамин — мама/Александр/Ирина), we keep
-        // the legacy default ({unsandboxed: true}) — the whitelist alone is the
-        // access gate, no further sandboxing.
         if (dmWhitelistFilePath) {
           const wl = loadDmWhitelist();
           const tpl = wl?.guest_agent_config_template;
@@ -967,7 +966,7 @@ registerChannel('telegram', (opts: ChannelOpts) => {
 
         opts.registerGroup!(jid, group);
         logger.info(
-          { jid, name, userId, runtime: runtime ?? 'default', sessionScope: sessionScope ?? 'folder', sandboxedTemplate: !!dmWhitelistFilePath },
+          { jid, name, userId, runtime: runtime ?? 'default', sessionScope: sessionScope ?? 'folder', guestTemplate: !!dmWhitelistFilePath },
           'Auto-registered private chat',
         );
       }

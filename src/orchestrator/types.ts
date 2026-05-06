@@ -40,9 +40,7 @@ export interface AgentConfig {
   disallowedTools?: string[];  // Tool blacklist (v2.1.78+ — applied on top of allowlist)
   maxTurns?: number;           // Max conversation turns
   costLimitUsd?: number;       // Per-run budget cap
-  allowedDomains?: string[];   // Extra network domains the sandbox agent can access (merged with base Anthropic + localhost)
-  unsandboxed?: boolean;       // Skip srt sandbox entirely — agent runs as the host user with no network/fs isolation. Use only on trusted internal hosts.
-  runTimeoutMs?: number;       // Hard wall-clock timeout per agent run. SIGTERM at this mark, SIGKILL 30s later. Defaults: 8 min sandbox, 15 min unsandboxed/container/deepseek.
+  runTimeoutMs?: number;       // Hard wall-clock timeout per agent run. SIGTERM at this mark, SIGKILL 30s later.
 }
 
 export interface RegisteredGroup {
@@ -53,7 +51,7 @@ export interface RegisteredGroup {
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
-  runtime?: 'container' | 'sandbox' | 'deepseek'; // Per-group runtime override (falls back to DEFAULT_RUNTIME)
+  runtime?: 'container' | 'host' | 'deepseek'; // Per-group runtime override (falls back to DEFAULT_RUNTIME)
   agentConfig?: AgentConfig;
   // Session keying scope. Default 'folder' = all jids sharing this folder share
   // one session_id (operative memory). 'jid' = each registered jid gets its own

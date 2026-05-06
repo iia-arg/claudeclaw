@@ -89,10 +89,10 @@ const webhookEnv = readEnvFile(['WEBHOOK_PORT', 'WEBHOOK_SECRET']);
 export const WEBHOOK_PORT = parseInt(process.env.WEBHOOK_PORT || webhookEnv.WEBHOOK_PORT || '3100', 10);
 export const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || webhookEnv.WEBHOOK_SECRET || '';
 
-// Runtime selection: 'container' (default, Apple Container / Docker) or 'sandbox' (srt)
-export const DEFAULT_RUNTIME: 'container' | 'sandbox' =
-  (process.env.RUNTIME || envConfig.RUNTIME || 'container') === 'sandbox'
-    ? 'sandbox'
+// Runtime selection: 'container' (default, Apple Container / Docker) or 'host' (direct, no isolation)
+export const DEFAULT_RUNTIME: 'container' | 'host' =
+  (process.env.RUNTIME || envConfig.RUNTIME || 'container') === 'host'
+    ? 'host'
     : 'container';
 
 // Timezone for scheduled tasks (cron expressions, etc.)

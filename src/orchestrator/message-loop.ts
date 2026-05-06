@@ -15,10 +15,9 @@ import {
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
 import {
-  cleanupSandboxOrphans,
-  ensureSandboxRuntimeAvailable,
-  runSandboxAgent,
-} from '../runtimes/sandbox-runner.js';
+  cleanupHostOrphans,
+  runHostAgent,
+} from '../runtimes/host-runner.js';
 import {
   ensureDeepSeekAvailable,
   runDeepSeekAgent,
@@ -428,8 +427,8 @@ async function runAgent(
     const output =
       runtime === 'deepseek'
         ? await runDeepSeekAgent(group, agentInput, onProcessCb, wrappedOnOutput)
-        : runtime === 'sandbox'
-          ? await runSandboxAgent(group, agentInput, onProcessCb, wrappedOnOutput)
+        : runtime === 'host'
+          ? await runHostAgent(group, agentInput, onProcessCb, wrappedOnOutput)
           : await runContainerAgent(
               group,
               agentInput,
@@ -452,7 +451,7 @@ async function runAgent(
     const turns = output.turns ?? lastTurns;
 
     if (output.status === 'error') {
-      const runtimeName = runtime === 'deepseek' ? 'DeepSeek' : runtime === 'sandbox' ? 'Sandbox' : 'Container';
+      const runtimeName = runtime === 'deepseek' ? 'DeepSeek' : runtime === 'host' ? 'Host' : 'Container';
       logger.error(
         { group: group.name, error: output.error },
         `${runtimeName} agent error`,
@@ -604,10 +603,10 @@ export async function main(): Promise<void> {
     allGroups.some(
       (g) => (g.runtime || DEFAULT_RUNTIME) === 'container',
     );
-  const needsSandbox =
-    DEFAULT_RUNTIME === 'sandbox' ||
+  const needsHost =
+    DEFAULT_RUNTIME === 'host' ||
     allGroups.some(
-      (g) => (g.runtime || DEFAULT_RUNTIME) === 'sandbox',
+      (g) => (g.runtime || DEFAULT_RUNTIME) === 'host',
     );
   const needsDeepSeek = allGroups.some(
     (g) => g.runtime === 'deepseek',
@@ -616,9 +615,8 @@ export async function main(): Promise<void> {
   if (needsContainers) {
     ensureContainerSystemRunning();
   }
-  if (needsSandbox) {
-    ensureSandboxRuntimeAvailable();
-    cleanupSandboxOrphans();
+  if (needsHost) {
+    cleanupHostOrphans();
   }
   if (needsDeepSeek) {
     try {

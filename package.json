@@ -20,7 +20,6 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@anthropic-ai/sandbox-runtime": "^0.0.49",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "better-sqlite3": "^12.9.0",
     "cron-parser": "^5.5.0",
