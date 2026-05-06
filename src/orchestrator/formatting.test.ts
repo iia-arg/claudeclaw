@@ -139,8 +139,12 @@ describe('TRIGGER_PATTERN', () => {
     expect(TRIGGER_PATTERN.test(`@${upper} hello`)).toBe(true);
   });
 
-  it('does not match when not at start of message', () => {
-    expect(TRIGGER_PATTERN.test(`hello @${name}`)).toBe(false);
+  it('matches mid-message as a whole word (Cyrillic-aware boundary)', () => {
+    // Updated by #7 (Cyrillic-aware trigger): old pattern was ^@name-anchored
+    // and broke usage like "помоги, Забава". Now we match anywhere as long as
+    // the surrounding chars are not Cyrillic/Latin letters.
+    expect(TRIGGER_PATTERN.test(`помоги, ${name}`)).toBe(true);
+    expect(TRIGGER_PATTERN.test(`hello @${name}`)).toBe(true);
   });
 
   it('does not match partial name like @NameExtra (word boundary)', () => {

@@ -24,7 +24,9 @@ describe('MessageRouter', () => {
       triggerType: 'agent-response',
     });
 
-    expect(slack.sendMessage).toHaveBeenCalledWith('C123', 'hello');
+    expect(slack.sendMessage).toHaveBeenCalledWith('C123', 'hello', {
+      replyTo: undefined,
+    });
   });
 
   it('strips internal tags from text', async () => {
@@ -37,7 +39,9 @@ describe('MessageRouter', () => {
       triggerType: 'agent-response',
     });
 
-    expect(slack.sendMessage).toHaveBeenCalledWith('C123', 'visible  text');
+    expect(slack.sendMessage).toHaveBeenCalledWith('C123', 'visible  text', {
+      replyTo: undefined,
+    });
   });
 
   it('does not deliver empty text after formatting', async () => {
@@ -59,7 +63,9 @@ describe('MessageRouter', () => {
 
     await router.send('C123', 'hello');
 
-    expect(slack.sendMessage).toHaveBeenCalledWith('C123', 'hello');
+    expect(slack.sendMessage).toHaveBeenCalledWith('C123', 'hello', {
+      replyTo: undefined,
+    });
   });
 
   it('pre-hook can drop message', async () => {
@@ -92,7 +98,9 @@ describe('MessageRouter', () => {
       triggerType: 'agent-response',
     });
 
-    expect(slack.sendMessage).toHaveBeenCalledWith('C123', 'hello [modified]');
+    expect(slack.sendMessage).toHaveBeenCalledWith('C123', 'hello [modified]', {
+      replyTo: undefined,
+    });
   });
 
   it('post-hook receives envelope after delivery', async () => {

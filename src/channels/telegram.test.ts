@@ -546,7 +546,9 @@ describe('TelegramChannel', () => {
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
-      const ctx = createMediaCtx({});
+      const ctx = createMediaCtx({
+        extra: { photo: [{ file_id: 'photo_lo', file_unique_id: 'u1' }] },
+      });
       await triggerMediaMessage('message:photo', ctx);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -560,7 +562,10 @@ describe('TelegramChannel', () => {
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
-      const ctx = createMediaCtx({ caption: 'Look at this' });
+      const ctx = createMediaCtx({
+        caption: 'Look at this',
+        extra: { photo: [{ file_id: 'photo_lo', file_unique_id: 'u1' }] },
+      });
       await triggerMediaMessage('message:photo', ctx);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -837,6 +842,7 @@ describe('TelegramChannel', () => {
       expect(currentBot().api.sendChatAction).toHaveBeenCalledWith(
         '100200300',
         'typing',
+        {},
       );
     });
 
