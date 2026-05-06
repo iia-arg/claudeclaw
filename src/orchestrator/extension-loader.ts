@@ -8,7 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
 import { logger } from './logger.js';
-import { validateManifest, type ExtensionManifest, type LoadResult } from './extension-manifest.js';
+import { validateManifest, type LoadResult } from './extension-manifest.js';
 
 // CODE_ROOT is where the ClaudeClaw code lives (for finding extensions/)
 // In dev mode: process.cwd()
@@ -80,33 +80,3 @@ export async function loadExtensions(): Promise<LoadResult[]> {
   return results;
 }
 
-/**
- * Collect allowedDomains from all installed extension manifests.
- * Returns deduplicated list of domains that extensions need for network access.
- */
-export function getExtensionAllowedDomains(): string[] {
-  const codeRoot = getCodeRoot();
-  const extensionsDir = path.join(codeRoot, 'extensions');
-  const domains: string[] = [];
-
-  if (!fs.existsSync(extensionsDir)) return domains;
-
-  const entries = fs.readdirSync(extensionsDir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith('claudeclaw-')) continue;
-    const manifestPath = path.join(extensionsDir, entry.name, 'manifest.json');
-    if (!fs.existsSync(manifestPath)) continue;
-
-    try {
-      const raw = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
-      const { valid, manifest } = validateManifest(raw);
-      if (valid && manifest?.provides?.allowedDomains) {
-        domains.push(...manifest.provides.allowedDomains);
-      }
-    } catch {
-      // Skip invalid manifests
-    }
-  }
-
-  return [...new Set(domains)];
-}

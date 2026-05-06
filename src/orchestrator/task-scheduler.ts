@@ -13,7 +13,7 @@ import {
   runContainerAgent,
   writeTasksSnapshot,
 } from '../runtimes/container-runner.js';
-import { runSandboxAgent } from '../runtimes/sandbox-runner.js';
+import { runHostAgent } from '../runtimes/host-runner.js';
 import { runDeepSeekAgent } from '../runtimes/deepseek-runner.js';
 import {
   getAllTasks,
@@ -187,8 +187,8 @@ async function runTask(
     const runner =
       runtime === 'deepseek'
         ? runDeepSeekAgent
-        : runtime === 'sandbox'
-          ? runSandboxAgent
+        : runtime === 'host'
+          ? runHostAgent
           : runContainerAgent;
 
     const output = await runner(
