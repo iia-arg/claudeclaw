@@ -24,7 +24,7 @@ import {
   updateTaskAfterRun,
 } from './db.js';
 import { writeExtensionToolsManifest } from './extension-tool-bridge.js';
-import { GroupQueue } from './group-queue.js';
+import { GroupQueue, resolveRunTimeoutMs } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { MessageRouter, RegisteredGroup, ScheduledTask } from './types.js';
@@ -60,7 +60,12 @@ export function computeNextRun(task: ScheduledTask): string | null {
     }
     // Anchor to the scheduled time, not now, to prevent drift.
     // Skip past any missed intervals so we always land in the future.
-    let next = new Date(task.next_run!).getTime() + ms;
+    // If next_run is missing (first-time backfill), anchor to now instead —
+    // otherwise we'd start from epoch 0 and loop millions of times.
+    const anchor = task.next_run
+      ? new Date(task.next_run).getTime()
+      : now;
+    let next = anchor + ms;
     while (next <= now) {
       next += ms;
     }
@@ -79,6 +84,7 @@ export interface SchedulerDependencies {
     proc: ChildProcess,
     containerName: string,
     groupFolder: string,
+    timeoutMs?: number,
   ) => void;
   router: MessageRouter;
 }
@@ -117,9 +123,17 @@ async function runTask(
   );
 
   const groups = deps.registeredGroups();
-  const group = Object.values(groups).find(
-    (g) => g.folder === task.group_folder,
-  );
+  // Prefer the registered group keyed by this task's exact chat_jid.
+  // Multiple JIDs can share a folder (e.g. tg-topic + bx24-portal both on
+  // `zhizn_yupiter`), and each JID may carry distinct agentConfig
+  // (allowedDomains, runtime, model). A blind folder-match would pick
+  // whichever Object.values iteration order returned first and execute
+  // the task under the wrong channel's settings. Fall back to folder
+  // lookup only if the JID isn't registered (legacy tasks where chat_jid
+  // was never recorded against a registered group).
+  const group =
+    groups[task.chat_jid] ??
+    Object.values(groups).find((g) => g.folder === task.group_folder);
 
   if (!group) {
     logger.error(
@@ -204,7 +218,13 @@ async function runTask(
         agentConfig: group.agentConfig,
       },
       (proc, containerName) =>
-        deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
+        deps.onProcess(
+          task.chat_jid,
+          proc,
+          containerName,
+          task.group_folder,
+          resolveRunTimeoutMs(runtime, group.agentConfig),
+        ),
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
@@ -266,6 +286,111 @@ async function runTask(
   updateTaskAfterRun(task.id, nextRun, resultSummary);
 }
 
+/**
+ * Normalize a stored timestamp to UTC ISO with explicit `Z` suffix.
+ * Returns null if the input cannot be parsed.
+ *
+ * Why this matters: getDueTasks does a STRING comparison
+ * `next_run <= ?` where `?` is `new Date().toISOString()` (Z-form).
+ * If next_run was inserted as `2026-05-04T20:00:00+03:00` (offset-form),
+ * the lex compare fails — the task hangs in 'active' forever despite
+ * the wall clock having passed. We saw this with rows added by manual
+ * SQL / migration paths that bypass the IPC handler's normalization.
+ */
+function normalizeToUtcZ(ts: string | null | undefined): string | null {
+  if (!ts) return null;
+  if (/Z$/.test(ts)) return ts;
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+/**
+ * Repair active scheduled tasks whose `next_run` is stored in a
+ * non-canonical (non-Z) timestamp form. See normalizeToUtcZ above for
+ * background. Called once at scheduler startup.
+ */
+export function normalizeNonUtcNextRuns(): number {
+  const tasks = getAllTasks().filter(
+    (t) =>
+      t.status === 'active' && t.next_run != null && !/Z$/.test(t.next_run),
+  );
+  if (tasks.length === 0) return 0;
+
+  let fixed = 0;
+  for (const t of tasks) {
+    const normalized = normalizeToUtcZ(t.next_run);
+    if (!normalized) {
+      logger.warn(
+        { taskId: t.id, nextRun: t.next_run },
+        'Cannot parse next_run for normalization; pausing task',
+      );
+      // Pause to stop scheduler-tick churn on a row we can't compare.
+      updateTask(t.id, { status: 'paused' });
+      continue;
+    }
+    if (normalized === t.next_run) continue;
+    updateTask(t.id, { next_run: normalized });
+    fixed++;
+    logger.info(
+      { taskId: t.id, before: t.next_run, after: normalized },
+      'Normalized next_run to UTC-Z form',
+    );
+  }
+  return fixed;
+}
+
+/**
+ * Backfill `next_run` for any active recurring task (cron/interval) where it is
+ * NULL. This catches tasks inserted directly into the DB (migrations, manual
+ * SQL) which never went through the IPC schedule_task path that computes
+ * next_run upfront. Without this, getDueTasks (which filters
+ * `next_run IS NOT NULL`) would silently skip them forever.
+ *
+ * Called at scheduler startup and is cheap enough to run on every tick as a
+ * safety net.
+ */
+export function backfillMissingNextRuns(): number {
+  const tasks = getAllTasks().filter(
+    (t) =>
+      t.status === 'active' &&
+      t.next_run == null &&
+      (t.schedule_type === 'cron' || t.schedule_type === 'interval'),
+  );
+  if (tasks.length === 0) return 0;
+
+  let fixed = 0;
+  for (const t of tasks) {
+    try {
+      const next = computeNextRun(t);
+      if (next) {
+        updateTask(t.id, { next_run: next });
+        fixed++;
+        logger.info(
+          {
+            taskId: t.id,
+            scheduleType: t.schedule_type,
+            scheduleValue: t.schedule_value,
+            nextRun: next,
+          },
+          'Backfilled missing next_run on recurring task',
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        {
+          taskId: t.id,
+          scheduleType: t.schedule_type,
+          scheduleValue: t.schedule_value,
+          err,
+        },
+        'Failed to backfill next_run; task remains inert',
+      );
+    }
+  }
+  return fixed;
+}
+
 let schedulerRunning = false;
 
 export function startSchedulerLoop(deps: SchedulerDependencies): void {
@@ -275,6 +400,24 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   }
   schedulerRunning = true;
   logger.info('Scheduler loop started');
+
+  // Repair tasks whose next_run is stored with a numeric offset (`+03:00`)
+  // rather than UTC `Z`. Lexicographic SQL compare against `new Date().toISOString()`
+  // (always Z-form) silently breaks for offset-form rows.
+  const renormalized = normalizeNonUtcNextRuns();
+  if (renormalized > 0) {
+    logger.info(
+      { count: renormalized },
+      'Normalized non-UTC next_run timestamps on startup',
+    );
+  }
+
+  // Repair any recurring tasks that were inserted with NULL next_run
+  // (e.g. migrations / manual SQL). Without this they would never fire.
+  const fixed = backfillMissingNextRuns();
+  if (fixed > 0) {
+    logger.info({ count: fixed }, 'Backfilled NULL next_run on startup');
+  }
 
   const loop = async () => {
     try {

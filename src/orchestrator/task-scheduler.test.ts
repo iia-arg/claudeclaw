@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _initTestDatabase, createTask, getTaskById } from './db.js';
 import {
   _resetSchedulerLoopForTests,
+  backfillMissingNextRuns,
   computeNextRun,
   startSchedulerLoop,
 } from './task-scheduler.js';
@@ -94,6 +95,88 @@ describe('task scheduler', () => {
     };
 
     expect(computeNextRun(task)).toBeNull();
+  });
+
+  it('backfillMissingNextRuns fixes cron tasks inserted with NULL next_run', () => {
+    createTask({
+      id: 'cron-null-nextrun',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'daily 20:00',
+      schedule_type: 'cron',
+      schedule_value: '0 20 * * *',
+      context_mode: 'isolated',
+      next_run: null,
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    const fixed = backfillMissingNextRuns();
+    expect(fixed).toBe(1);
+
+    const task = getTaskById('cron-null-nextrun');
+    expect(task?.next_run).not.toBeNull();
+    expect(new Date(task!.next_run!).getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it('backfillMissingNextRuns anchors interval tasks to now without infinite loop', () => {
+    createTask({
+      id: 'interval-null-nextrun',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'every 5 min',
+      schedule_type: 'interval',
+      schedule_value: '300000', // 5 min
+      context_mode: 'isolated',
+      next_run: null,
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    const fixed = backfillMissingNextRuns();
+    expect(fixed).toBe(1);
+
+    const task = getTaskById('interval-null-nextrun');
+    expect(task?.next_run).not.toBeNull();
+    const next = new Date(task!.next_run!).getTime();
+    // Should be ~now + 5min, not millions of iterations from epoch 0
+    expect(next).toBeGreaterThan(Date.now());
+    expect(next).toBeLessThanOrEqual(Date.now() + 300000 + 1000);
+  });
+
+  it('backfillMissingNextRuns leaves once-tasks and already-scheduled tasks alone', () => {
+    createTask({
+      id: 'once-task',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'one-shot',
+      schedule_type: 'once',
+      schedule_value: '2026-12-31T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: null, // legitimately null for completed once-tasks
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    createTask({
+      id: 'cron-already-set',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'daily',
+      schedule_type: 'cron',
+      schedule_value: '0 20 * * *',
+      context_mode: 'isolated',
+      next_run: '2026-12-31T17:00:00.000Z',
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    const fixed = backfillMissingNextRuns();
+    expect(fixed).toBe(0);
+
+    expect(getTaskById('once-task')?.next_run).toBeNull();
+    expect(getTaskById('cron-already-set')?.next_run).toBe(
+      '2026-12-31T17:00:00.000Z',
+    );
   });
 
   it('computeNextRun skips missed intervals without infinite loop', () => {
