@@ -20,3 +20,9 @@ scripts/gdrive-upload.py
 scripts/create-gdoc.cjs
 scripts/get-doc-link.cjs
 scripts/google-oauth.py
+
+# Runtime PID lock written by service entry on startup
+.claudeclaw.pid
+
+# Per-instance operations logs (runtime artifacts, not source)
+docs/operations-log/
