@@ -242,6 +242,21 @@ export async function runHostAgent(
       '_tool-responses',
     );
 
+    // Per-group Claude SDK config dir — isolates sessions/projects per group.
+    // Mirrors what the deleted sandbox-runner achieved via the
+    // /home/node/.claude bind-mount: the SDK reads/writes session JSONLs
+    // under <CLAUDE_CONFIG_DIR>/projects/<encoded-cwd>/<uuid>.jsonl.
+    // Without this, all groups would share ~/.claude/projects/ and any
+    // sessionId stored in the DB that lives under DATA_DIR/sessions/<folder>/
+    // would fail to resume with "No conversation found with session ID".
+    // Path matches groupSessionsDir constructed in buildHostPaths().
+    pathEnv.CLAUDE_CONFIG_DIR = path.join(
+      DATA_DIR,
+      'sessions',
+      group.folder,
+      '.claude',
+    );
+
     // Real credentials passed directly (no proxy on host).
     const secrets = readEnvFile([
       'ANTHROPIC_API_KEY',
